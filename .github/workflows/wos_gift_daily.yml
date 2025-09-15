@@ -3,11 +3,15 @@ name: WOS Gift Redeemer (Daily)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 8 * * *"  # every day at 08:00 UTC
+    - cron: "0 8 * * *"   # every day at 08:00 UTC
 
 jobs:
   run-redeemer:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: wos-gift-redeemer
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -16,13 +20,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests playwright
-          python -m playwright install --with-deps chromium
+          pip install requests
+
+      - name: Set up Playwright
+        uses: microsoft/playwright-github-action@v1
 
       - name: Run gift redeemer
         env:
@@ -52,7 +58,6 @@ jobs:
             return hashlib.md5(s.encode("utf-8")).hexdigest()
 
           def sign_sorted(form: dict) -> str:
-            # Sort by key name, then append SECRET
             items = sorted((k, str(v)) for k, v in form.items())
             base = "&".join([f"{k}={v}" for k, v in items])
             return md5(base + SECRET), base
@@ -67,48 +72,43 @@ jobs:
             }
             if cookie:
               headers["Cookie"] = cookie
-
             data = urlencode(form)
-            resp = requests.post(url, headers=headers, data=data, timeout=15)
+            resp = requests.post(url, headers=headers, data=data, timeout=20)
             return resp.status_code, resp.text
 
-          # 1) Get a real browser cookie from the gift site (bypasses "params error")
           print("Launching headless Chromium to collect session cookie…")
           with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             ctx = browser.new_context()
             page = ctx.new_page()
-            page.goto(REFERER, wait_until="domcontentloaded", timeout=30000)
-            # Give any JS/WAF a moment to set cookies
-            page.wait_for_timeout(2000)
-            cookies = ctx.cookies()  # list of dicts
+            page.goto(REFERER, wait_until="networkidle", timeout=45000)
+            page.wait_for_timeout(3000)
+            cookies = ctx.cookies()
             browser.close()
 
-          # Build Cookie header
           cookie_pairs = []
           for c in cookies:
-            # Only include first-party cookies that look relevant
-            if "wos-giftcode.centurygame.com" in c.get("domain",""):
+            domain = (c.get("domain") or "").lstrip(".")
+            if domain.endswith("wos-giftcode.centurygame.com"):
               cookie_pairs.append(f"{c['name']}={c['value']}")
           cookie_hdr = "; ".join(cookie_pairs)
           print("Cookie header assembled:", "[present]" if cookie_hdr else "[none]")
 
-          ok_players = 0
-          ok_redeems = 0
-          fail_redeems = 0
+          safe_code = CODE[:3] + "…" if len(CODE) > 3 else CODE
 
-          print(f"START run — IDs={len(FIDS)}; gift_code={CODE}")
+          ok_players = ok_redeems = fail_redeems = 0
+          print(f"START run — IDs={len(FIDS)}; gift_code={safe_code}")
+
           for fid in FIDS:
-            # 2) /api/player check
             ts = str(int(time.time()))
             form_p = {"fid": fid, "time": ts}
             sign_p, _ = sign_sorted(form_p)
             form_p["sign"] = sign_p
 
-            http_p, body_p = post_form(PLAYER_URL, form_p, cookie=None)  # player usually doesn't need cookie
+            http_p, body_p = post_form(PLAYER_URL, form_p, cookie=None)
             try:
               js = json.loads(body_p)
-            except:
+            except Exception:
               js = {}
             if http_p == 200 and js.get("msg") == "success":
               data = js.get("data", {})
@@ -117,10 +117,9 @@ jobs:
               print(f"PLAYER OK  fid={fid} nick={nick} stove={stove}")
               ok_players += 1
             else:
-              print(f"PLAYER FAIL fid={fid} http={http_p} body={body_p}")
+              print(f"PLAYER FAIL fid={fid} http={http_p} body={body_p[:200]}")
               continue
 
-            # 3) /api/gift_code redeem
             ts2 = str(int(time.time()))
             form_g = {"fid": fid, "cdk": CODE, "time": ts2}
             sign_g, _ = sign_sorted(form_g)
@@ -145,19 +144,16 @@ jobs:
                 status = "PARAMS_ERROR"
               else:
                 status = msg or "UNKNOWN"
-            except:
+            except Exception:
               status = "PARSE_ERROR"
 
-            print(f"GIFT fid={fid} code={CODE} http={http_g} status={status} body={body_g}")
+            print(f"GIFT fid={fid} code={safe_code} http={http_g} status={status} body={body_g[:200]}")
 
             if status in ("SUCCESS","ALREADY","SAME_TYPE"):
               ok_redeems += 1
             else:
               fail_redeems += 1
 
-            time.sleep(0.3)  # small pacing
+            time.sleep(0.3)
 
-          print(f"GIFT SUMMARY code={CODE} success={ok_redeems} failed={fail_redeems}")
-          print("END run")
-          PY
-          python run_wos_redeem.py
+          print(f"GIFT SUMMARY code={safe_code} success={ok_redeems} fai
