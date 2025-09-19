@@ -1,12 +1,13 @@
+# .github/workflows/discord_daily_batch.yml
 name: Discord-driven daily batch
 
 on:
   schedule:
-    - cron: "0 08 * * *"   # 08:00 UTC daily – change as needed
-  workflow_dispatch: {}     # manual runs from Actions tab
+    - cron: "0 08 * * *"   # change time as needed (UTC)
+  workflow_dispatch: {}
 
 permissions:
-  contents: write           # allow committing the small state files
+  contents: write
 
 jobs:
   run:
@@ -28,14 +29,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Set up Playwright (to fetch site cookie)
+      - name: Set up Playwright
         uses: microsoft/playwright-github-action@v1
 
-      - name: Run daily job (read Discord → update roster → redeem → furnace diffs → post summary)
+      - name: Run daily job
         env:
-          DISCORD_BOT_TOKEN:  ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
-          WOS_SECRET:         ${{ secrets.WOS_SECRET }}
+          DISCORD_BOT_TOKEN:        ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CODES_CHANNEL_ID: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}   # ← gift_code_axe
+          DISCORD_IDS_CHANNEL_ID:   ${{ secrets.DISCORD_IDS_CHANNEL_ID }}     # ← 3349_axe
+          DISCORD_SUMMARY_CHANNEL_ID: ${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }} # optional; falls back to codes channel
+          WOS_SECRET:               ${{ secrets.WOS_SECRET }}
         run: |
           python scripts/daily_discord_batch.py
 
