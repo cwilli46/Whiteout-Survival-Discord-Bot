@@ -1,164 +1,49 @@
-name: WOS Gift Redeemer (Daily)
+name: Discord-driven daily batch
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 8 * * *"   # every day at 08:00 UTC
+    - cron: "0 08 * * *"   # 08:00 UTC daily – change as needed
+  workflow_dispatch: {}     # manual runs from Actions tab
+
+permissions:
+  contents: write           # allow committing the small state files
 
 jobs:
-  run-redeemer:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     concurrency:
-      group: wos-gift-redeemer
+      group: discord-daily-batch
       cancel-in-progress: false
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install requests
-      # Using the official action is more reliable than raw `playwright install`
-      - name: Set up Playwright
+
+      - name: Set up Playwright (to fetch site cookie)
         uses: microsoft/playwright-github-action@v1
 
-      - name: Run gift redeemer
+      - name: Run daily job (read Discord → update roster → redeem → furnace diffs → post summary)
         env:
-          WOS_SECRET: ${{ secrets.WOS_SECRET }}
-          GIFT_CODE:  ${{ secrets.GIFT_CODE }}
-          FIDS:       ${{ secrets.FIDS }}
+          DISCORD_BOT_TOKEN:  ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          WOS_SECRET:         ${{ secrets.WOS_SECRET }}
         run: |
-          cat > run_wos_redeem.py << 'PY'
-          import os, time, hashlib, requests, json, sys
-          from urllib.parse import urlencode
-          from playwright.sync_api import sync_playwright
+          python scripts/daily_discord_batch.py
 
-          SECRET = os.environ.get("WOS_SECRET", "").strip()
-          CODE   = os.environ.get("GIFT_CODE", "").strip()
-          FIDS   = [x.strip() for x in os.environ.get("FIDS","").split(",") if x.strip()]
-
-          PLAYER_URL   = "https://wos-giftcode-api.centurygame.com/api/player"
-          GIFTCODE_URL = "https://wos-giftcode-api.centurygame.com/api/gift_code"
-          ORIGIN       = "https://wos-giftcode.centurygame.com"
-          REFERER      = "https://wos-giftcode.centurygame.com/"
-
-          if not SECRET or not CODE or not FIDS:
-              print("Missing env: WOS_SECRET / GIFT_CODE / FIDS")
-              sys.exit(1)
-
-          def md5(s: str) -> str:
-              return hashlib.md5(s.encode("utf-8")).hexdigest()
-
-          def sign_sorted(form: dict) -> str:
-              items = sorted((k, str(v)) for k, v in form.items())
-              base = "&".join([f"{k}={v}" for k, v in items])
-              return md5(base + SECRET), base
-
-          def post_form(url: str, form: dict, cookie: str | None):
-              headers = {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  "Origin": ORIGIN,
-                  "Referer": REFERER,
-                  "Accept": "application/json, text/plain, */*",
-                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-              }
-              if cookie:
-                  headers["Cookie"] = cookie
-              data = urlencode(form)
-              resp = requests.post(url, headers=headers, data=data, timeout=20)
-              return resp.status_code, resp.text
-
-          # Get a fresh cookie from the gift site
-          print("Launching headless Chromium to collect session cookie…")
-          with sync_playwright() as p:
-              browser = p.chromium.launch(headless=True)
-              ctx = browser.new_context()
-              page = ctx.new_page()
-              page.goto(REFERER, wait_until="networkidle", timeout=45000)
-              page.wait_for_timeout(3000)
-              cookies = ctx.cookies()
-              browser.close()
-
-          cookie_pairs = []
-          for c in cookies:
-              domain = (c.get("domain") or "").lstrip(".")
-              if domain.endswith("wos-giftcode.centurygame.com"):
-                  cookie_pairs.append(f"{c['name']}={c['value']}")
-          cookie_hdr = "; ".join(cookie_pairs)
-          print("Cookie header assembled:", "[present]" if cookie_hdr else "[none]")
-
-          safe_code = CODE[:3] + "…" if len(CODE) > 3 else CODE
-          ok_players = ok_redeems = fail_redeems = 0
-          print(f"START run — IDs={len(FIDS)}; gift_code={safe_code}")
-
-          for fid in FIDS:
-              ts = str(int(time.time()))
-              form_p = {"fid": fid, "time": ts}
-              sign_p, _ = sign_sorted(form_p)
-              form_p["sign"] = sign_p
-
-              http_p, body_p = post_form(PLAYER_URL, form_p, cookie=None)
-              try:
-                  js = json.loads(body_p)
-              except Exception:
-                  js = {}
-              if http_p == 200 and js.get("msg") == "success":
-                  data = js.get("data", {})
-                  nick = data.get("nickname")
-                  stove = data.get("stove_lv")
-                  print(f"PLAYER OK  fid={fid} nick={nick} stove={stove}")
-                  ok_players += 1
-              else:
-                  print(f"PLAYER FAIL fid={fid} http={http_p} body={body_p[:200]}")
-                  continue
-
-              ts2 = str(int(time.time()))
-              form_g = {"fid": fid, "cdk": CODE, "time": ts2}
-              sign_g, _ = sign_sorted(form_g)
-              form_g["sign"] = sign_g
-
-              http_g, body_g = post_form(GIFTCODE_URL, form_g, cookie_hdr)
-              status = "UNKNOWN"
-              try:
-                  rg = json.loads(body_g)
-                  msg = (rg.get("msg") or "").upper()
-                  if "SUCCESS" in msg:
-                      status = "SUCCESS"
-                  elif "RECEIVED" in msg:
-                      status = "ALREADY"
-                  elif "SAME TYPE EXCHANGE" in msg:
-                      status = "SAME_TYPE"
-                  elif "TIME ERROR" in msg:
-                      status = "EXPIRED"
-                  elif "CDK NOT FOUND" in msg:
-                      status = "INVALID"
-                  elif "PARAMS" in msg:
-                      status = "PARAMS_ERROR"
-                  else:
-                      status = msg or "UNKNOWN"
-              except Exception:
-                  status = "PARSE_ERROR"
-
-              print(f"GIFT fid={fid} code={safe_code} http={http_g} status={status} body={body_g[:200]}")
-
-              if status in ("SUCCESS","ALREADY","SAME_TYPE"):
-                  ok_redeems += 1
-              else:
-                  fail_redeems += 1
-
-              time.sleep(0.3)
-
-          print(f"GIFT SUMMARY code={safe_code} success={ok_redeems} failed={fail_redeems}")
-          if ok_players == 0 or (ok_redeems == 0 and fail_redeems > 0):
-              sys.exit(1)
-          print("END run")
-          PY
-          python run_wos_redeem.py
+      - name: Persist checkpoint and roster
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/wos_state.json .github/roster.json || true
+          git commit -m "update daily state" || echo "no changes"
+          git push || echo "no push"
