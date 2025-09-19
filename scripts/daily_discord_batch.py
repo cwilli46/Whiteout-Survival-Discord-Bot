@@ -2,14 +2,17 @@ import os, sys, json, re, time, hashlib, requests
 from urllib.parse import urlencode
 from playwright.sync_api import sync_playwright
 
-# ====== CONFIG FROM SECRETS ======
+# ====== CONFIG ======
 BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-CHANNEL_ID  = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+CODES_CH    = os.environ.get("DISCORD_CODES_CHANNEL_ID", "").strip()
+IDS_CH      = os.environ.get("DISCORD_IDS_CHANNEL_ID", "").strip()
+SUMMARY_CH  = os.environ.get("DISCORD_SUMMARY_CHANNEL_ID", "").strip() or CODES_CH
 WOS_SECRET  = os.environ.get("WOS_SECRET", "").strip()
-if not BOT_TOKEN or not CHANNEL_ID or not WOS_SECRET:
-    print("Missing DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID / WOS_SECRET"); sys.exit(1)
+if not all([BOT_TOKEN, CODES_CH, IDS_CH, WOS_SECRET]):
+    print("Missing one of: DISCORD_BOT_TOKEN, DISCORD_CODES_CHANNEL_ID, DISCORD_IDS_CHANNEL_ID, WOS_SECRET")
+    sys.exit(1)
 
-# ====== DISCORD REST (no gateway) ======
+# ====== DISCORD REST ======
 D_API = "https://discord.com/api/v10"
 D_HDR = {"Authorization": f"Bot {BOT_TOKEN}"}
 
@@ -28,8 +31,8 @@ def post_message(channel_id, content):
 
 def snowflake_max(msgs): return max((int(m["id"]) for m in msgs), default=0)
 
-# ====== STATE & ROSTER PERSISTENCE ======
-STATE_PATH  = ".github/wos_state.json"   # stores last processed msg ID
+# ====== STATE & ROSTER ======
+STATE_PATH  = ".github/wos_state.json"   # { "last_id_codes": "...", "last_id_ids": "..." }
 ROSTER_PATH = ".github/roster.json"      # { fid: {nickname, stove, updated_at} }
 
 def load_json(path, default):
@@ -44,41 +47,48 @@ def save_json(path, data):
 state  = load_json(STATE_PATH, {})
 roster = load_json(ROSTER_PATH, {})
 
-# ====== PARSERS (how you post in Discord) ======
-# Supported message formats (content or .txt/.csv/.yaml attachment):
-# 1) YAML-ish lists:
-#    codes:
-#      - OFFICIALSTORE
-#      - THANKYOU2025
-#    fids:
-#      - 550810376
-#      - 244886619
-# 2) CSV:
-#    FID,CODE
-#    550810376, OFFICIALSTORE
-#    244886619, THANKYOU2025
+# ====== PARSERS ======
+# Supported formats in each channel:
+#   #gift_code_axe (codes):
+#     codes:
+#       - OFFICIALSTORE
+#       - THANKYOU2025
+#   OR CSV lines "CODE"
+#   #3349_axe (ids):
+#     fids:
+#       - 550810376
+#       - 244886619
+#   OR CSV lines "FID"
 
 YAML_CODES = re.compile(r"(?mi)^\s*codes\s*:\s*$")
 YAML_FIDS  = re.compile(r"(?mi)^\s*fids\s*:\s*$")
 BULLET     = re.compile(r"(?m)^\s*-\s*(\S+)\s*$")
-CSV_LINE   = re.compile(r"(?mi)^\s*(\d{6,12})\s*,\s*([A-Z0-9]{4,24})\s*$")
+CSV_CODE   = re.compile(r"(?mi)^\s*([A-Z0-9]{4,24})\s*$")
+CSV_FID    = re.compile(r"(?mi)^\s*(\d{6,12})\s*$")
 
-def parse_payload(text):
-    codes, fids = set(), set()
-    # YAML-ish
-    if YAML_CODES.search(text) and YAML_FIDS.search(text):
-        current = None
-        for line in text.splitlines():
-            if YAML_CODES.match(line): current="codes"; continue
-            if YAML_FIDS.match(line):  current="fids";  continue
-            m = BULLET.match(line)
-            if m and current=="codes": codes.add(m.group(1).strip().upper())
-            elif m and current=="fids": fids.add(m.group(1).strip())
-    # CSV
-    for m in CSV_LINE.finditer(text):
-        fids.add(m.group(1))
-        codes.add(m.group(2).upper())
-    return sorted(codes), sorted(fids)
+def parse_codes(text):
+    out = set()
+    current = None
+    for line in text.splitlines():
+        if YAML_CODES.match(line): current="codes"; continue
+        m = BULLET.match(line)
+        if m and current=="codes": out.add(m.group(1).strip().upper())
+        else:
+            m2 = CSV_CODE.match(line)
+            if m2: out.add(m2.group(1).upper())
+    return sorted(out)
+
+def parse_fids(text):
+    out = set()
+    current = None
+    for line in text.splitlines():
+        if YAML_FIDS.match(line): current="fids"; continue
+        m = BULLET.match(line)
+        if m and current=="fids": out.add(m.group(1).strip())
+        else:
+            m2 = CSV_FID.match(line)
+            if m2: out.add(m2.group(1))
+    return sorted(out)
 
 def fetch_text_attachments(msg):
     texts = []
@@ -130,27 +140,32 @@ def get_cookie_header():
             pairs.append(f"{c['name']}={c['value']}")
     return "; ".join(pairs)
 
-# ====== READ NEW DISCORD INSTRUCTIONS ======
-after_id = state.get("last_id")
-msgs = get_messages_after(CHANNEL_ID, after_id)
-if not msgs and not after_id:
-    # first run: read last page anyway
-    msgs = get_messages_after(CHANNEL_ID, None)
+# ====== READ NEW CODES (codes channel) ======
+last_codes_id = state.get("last_id_codes")
+msgs_codes = get_messages_after(CODES_CH, last_codes_id) or []
+codes = set()
+for m in msgs_codes:
+    text = m.get("content","")
+    codes.update(parse_codes(text))
+    for t in fetch_text_attachments(m):
+        codes.update(parse_codes(t))
+if msgs_codes:
+    state["last_id_codes"] = str(max(int(state.get("last_id_codes") or 0), snowflake_max(msgs_codes)))
 
-all_codes, new_fids = set(), set()
-if msgs:
-    for m in msgs:
-        txt = m.get("content","")
-        c, f = parse_payload(txt)
-        for t in fetch_text_attachments(m):
-            c2, f2 = parse_payload(t)
-            c += c2; f += f2
-        all_codes.update(c); new_fids.update(f)
+# ====== READ NEW FIDs (ids channel) ======
+last_ids_id = state.get("last_id_ids")
+msgs_ids = get_messages_after(IDS_CH, last_ids_id) or []
+new_fids = set()
+for m in msgs_ids:
+    text = m.get("content","")
+    new_fids.update(parse_fids(text))
+    for t in fetch_text_attachments(m):
+        new_fids.update(parse_fids(t))
+if msgs_ids:
+    state["last_id_ids"] = str(max(int(state.get("last_id_ids") or 0), snowflake_max(msgs_ids)))
 
-# Update checkpoint now so we don't reprocess
-if msgs:
-    state["last_id"] = str(max(int(state.get("last_id") or 0), snowflake_max(msgs)))
-    save_json(STATE_PATH, state)
+# Save checkpoint now
+save_json(STATE_PATH, state)
 
 # ====== UPDATE ROSTER ======
 added = []
@@ -159,17 +174,18 @@ for fid in sorted(new_fids):
         roster[fid] = {"nickname": None, "stove": None, "updated_at": None}
         added.append(fid)
 
-# ====== SCAN ALL ROSTER FOR FURNACE UPDATES ======
+# ====== FURNACE SCAN (all roster) ======
 cookie_hdr = get_cookie_header()
 print("Cookie:", "[present]" if cookie_hdr else "[none]")
 
-furnace_diffs = []
 ok_players = 0
+furnace_diffs = []
 
 for fid, rec in roster.items():
     ts = str(int(time.time()))
-    form_p = {"fid": fid, "time": ts, "sign": sign_sorted({"fid": fid, "time": ts}, WOS_SECRET)}
-    hp, bp = post_form(PLAYER_URL, form_p, cookie=None)
+    payload = {"fid": fid, "time": ts}
+    payload["sign"] = sign_sorted(payload, WOS_SECRET)
+    hp, bp = post_form(PLAYER_URL, payload, cookie=None)
     try:
         js = json.loads(bp)
     except Exception:
@@ -182,24 +198,24 @@ for fid, rec in roster.items():
         stove = data.get("stove_lv")
         prev = rec.get("stove")
         rec.update({"nickname": nick, "stove": stove, "updated_at": int(time.time())})
-        if prev is not None and stove is not None and int(stove) > int(prev):
-            furnace_diffs.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
-    else:
-        # Keep going; we’ll report in summary
-        pass
+        try:
+            if prev is not None and stove is not None and int(stove) > int(prev):
+                furnace_diffs.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
+        except Exception:
+            pass
     time.sleep(0.2)
 
-# ====== REDEEM NEW CODES (for all roster FIDs) ======
-safe_codes = [c[:3]+"…" if len(c)>3 else c for c in sorted(all_codes)]
+# ====== REDEEM (new codes for ALL roster FIDs) ======
+codes = sorted(codes)
 ok_redeems = fail_redeems = 0
 redeem_lines = []
-
-for code in sorted(all_codes):
+for code in codes:
+    safe_code = code[:3]+"…" if len(code)>3 else code
     for fid in sorted(roster.keys()):
         ts2 = str(int(time.time()))
-        form_g = {"fid": fid, "cdk": code, "time": ts2,
-                  "sign": sign_sorted({"fid": fid, "cdk": code, "time": ts2}, WOS_SECRET)}
-        hg, bg = post_form(GIFTCODE_URL, form_g, cookie_hdr)
+        payload = {"fid": fid, "cdk": code, "time": ts2}
+        payload["sign"] = sign_sorted(payload, WOS_SECRET)
+        hg, bg = post_form(GIFTCODE_URL, payload, cookie_hdr)
 
         status = "UNKNOWN"
         try:
@@ -218,18 +234,18 @@ for code in sorted(all_codes):
         if ok: ok_redeems += 1
         else:  fail_redeems += 1
         emoji = "✅" if ok else "❌"
-        redeem_lines.append(f"{emoji} {fid} • {code} • {status}")
+        redeem_lines.append(f"{emoji} {fid} • {safe_code} • {status}")
         time.sleep(0.2)
 
-# ====== SAVE ROSTER ======
+# Save roster (with updated nick/stove)
 save_json(ROSTER_PATH, roster)
 
-# ====== POST SUMMARY ======
+# ====== SUMMARY ======
 parts = []
 if added:
-    parts.append("**New IDs added to roster**\n" + ", ".join(f"`{a}`" for a in added[:20]) + ("" if len(added)<=20 else " …"))
-if all_codes:
-    parts.append("**Codes processed today**\n" + ", ".join(f"`{c}`" for c in sorted(all_codes)))
+    parts.append("**New IDs added**\n" + ", ".join(f"`{a}`" for a in added[:20]) + ("" if len(added)<=20 else " …"))
+if codes:
+    parts.append("**Codes processed**\n" + ", ".join(f"`{c}`" for c in codes))
 if furnace_diffs:
     parts.append("**Furnace level ups**\n" + "\n".join(furnace_diffs[:15]) + ("" if len(furnace_diffs)<=15 else "\n…"))
 if redeem_lines:
@@ -240,8 +256,8 @@ summary = (
     f"Players checked: {ok_players}\n"
     f"Redeems: {ok_redeems} ok / {fail_redeems} failed\n"
 )
-post_message(CHANNEL_ID, summary + ("\n" + "\n\n".join(parts) if parts else "\n(No changes today)"))
+post_message(SUMMARY_CH, summary + ("\n" + "\n\n".join(parts) if parts else "\n(No changes today)"))
 
-# Exit non-zero if everything failed (useful for alerts)
-if ok_players == 0 or (all_codes and ok_redeems == 0):
+# Non-zero exit if everything failed (helps you notice problems)
+if ok_players == 0 or (codes and ok_redeems == 0):
     sys.exit(1)
