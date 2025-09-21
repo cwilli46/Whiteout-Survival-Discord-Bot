@@ -172,6 +172,20 @@ def post_form(url: str, form: dict, cookie: str | None):
     r = requests.post(url, headers=headers, data=urlencode(form), timeout=20)
     return r.status_code, r.text
 
+def get_form(url: str, params: dict, cookie: str | None):
+    # GET version of post_form with browsery headers
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Origin": ORIGIN,
+        "Referer": REFERER,
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    return r.status_code, r.text
+
+
 def get_cookie_header():
     print("Acquiring site cookie via headless Chromium…")
     with sync_playwright() as p:
@@ -329,8 +343,8 @@ if added:
 if codes:
     parts.append("**Codes processed**\n" + ", ".join(f"`{c}`" for c in codes))
 
-if furnace_ups:
-    parts.append("**Furnace level ups**\n" + "\n".join(furnace_ups[:15]) + (" \n…" if len(furnace_ups)>15 else ""))
+if furnace_diffs:
+    parts.append("**Furnace level ups**\n" + "\n".join(furnace_diffs[:15]) + (" \n…" if len(furnace_diffs)>15 else ""))
 elif furnace_snapshot:
     parts.append("**Furnace levels (snapshot)**\n" + "\n".join(furnace_snapshot[:15]) + (" \n…" if len(furnace_snapshot)>15 else ""))
 
