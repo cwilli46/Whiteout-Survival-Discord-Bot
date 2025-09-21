@@ -340,82 +340,130 @@ try:
                 furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {rec.get('nickname') or ''}")
         furnace_snapshot.sort()
 
-    # ---- redeem for all roster fids ----
-    ok_redeems = fail_redeems = 0
-    redeem_lines = []
+# ---- redeem for all roster fids ----
+ok_redeems = fail_redeems = 0
+redeem_lines = []
 
-    # attempt matrix covering common variants
-    ATTEMPTS = [
-        # method, order, concat, ts, uppercase, lang, body, use_cookie
-        # POST first (most common)
-        ("POST","fixed","plain","s", False, False,"form", True),
-        ("POST","sorted","plain","s", False, False,"form", True),
-        ("POST","fixed","amp",  "s", False, False,"form", True),
-        ("POST","fixed","key",  "s", False, False,"form", True),
-        ("POST","fixed","prefix","s", False, False,"form", True),
-        ("POST","fixed","plain","ms",False, False,"form", True),
-        ("POST","fixed","plain","s", True,  False,"form", True),
-        ("POST","fixed","plain","s", False, True, "form", True),
+# pacing and backoff
+PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "1.25"))
 
-        # try again without cookie (some WAFs dislike it)
-        ("POST","fixed","plain","s", False, False,"form", False),
+def redeem_with_backoff(cookie_hdr, fid, code, variant):
+    """Retry same variant when server says 429 (rate limited)."""
+    http, bodytxt = None, ""
+    for i in range(3):
+        http, bodytxt = redeem_once(cookie_hdr, fid, code, variant)
+        if http == 429:
+            # exponential backoff: 2s, 4s, 8s
+            time.sleep(2 ** (i + 1))
+            continue
+        break
+    return http, bodytxt
 
-        # JSON body (rare but seen)
-        ("POST","fixed","plain","s", False, False,"json", True),
+# default attempt list; we'll re-order based on method_hint
+DEFAULT_ATTEMPTS = [
+    # method, order, concat, ts, uppercase, lang, body, use_cookie
+    ("POST","fixed","plain","s", False, False,"form", True),
+    ("POST","sorted","plain","s", False, False,"form", True),
+    ("POST","fixed","amp",  "s", False, False,"form", True),
+    ("POST","fixed","key",  "s", False, False,"form", True),
+    ("POST","fixed","prefix","s", False, False,"form", True),
+    ("POST","fixed","plain","ms",False, False,"form", True),
+    ("POST","fixed","plain","s", True,  False,"form", True),
+    ("POST","fixed","plain","s", False, True, "form", True),
+    ("POST","fixed","plain","s", False, False,"json", True),  # JSON body
 
-        # GET variants
-        ("GET","fixed","plain","s", False, False,"form", True),
-        ("GET","sorted","plain","s", False, False,"form", True),
-        ("GET","fixed","amp",  "s", False, False,"form", True),
-        ("GET","fixed","key",  "s", False, False,"form", True),
-        ("GET","fixed","prefix","s", False, False,"form", True),
-        ("GET","fixed","plain","ms",False, False,"form", True),
-        ("GET","fixed","plain","s", True,  False,"form", True),
-        ("GET","fixed","plain","s", False, True, "form", True),
-        ("GET","fixed","plain","s", False, False,"form", False),
-    ]
+    # try without cookie once
+    ("POST","fixed","plain","s", False, False,"form", False),
 
-    for code in sorted(codes):
-        safe_code = code[:3]+"…" if len(code)>3 else code
-        for fid in sorted(roster.keys()):
-            status = "UNKNOWN"
-            for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in ATTEMPTS:
-                variant = {
-                    "method": method, "order": order, "concat": concat,
-                    "ts": ts_mode, "uppercase": upper, "lang": lang,
-                    "body": body, "use_cookie": use_cookie
-                }
-                http, bodytxt = redeem_once(cookie_hdr, fid, code, variant)
-                try:
-                    rg = json.loads(bodytxt); msg = (rg.get("msg") or "").upper()
-                except Exception:
-                    msg = (bodytxt or "")[:80].upper()
+    # GET variants
+    ("GET","fixed","plain","s", False, False,"form", True),
+    ("GET","sorted","plain","s", False, False,"form", True),
+    ("GET","fixed","amp",  "s", False, False,"form", True),
+    ("GET","fixed","key",  "s", False, False,"form", True),
+    ("GET","fixed","prefix","s", False, False,"form", True),
+    ("GET","fixed","plain","ms",False, False,"form", True),
+    ("GET","fixed","plain","s", True,  False,"form", True),
+    ("GET","fixed","plain","s", False, True, "form", True),
+    ("GET","fixed","plain","s", False, False,"form", False),
+]
 
-                # Normalize and decide whether to stop trying
-                if "SUCCESS" in msg:
-                    status = "SUCCESS"; break
-                elif "RECEIVED" in msg:
-                    status = "ALREADY"; break
-                elif "SAME TYPE EXCHANGE" in msg:
-                    status = "SAME_TYPE"; break
-                elif "TIME ERROR" in msg:
-                    status = "EXPIRED"; break
-                elif "CDK NOT FOUND" in msg:
-                    status = "INVALID"; break
-                elif "PARAMS" in msg or "SIGN" in msg:
-                    status = "SIGN ERROR" if "SIGN" in msg else "PARAMS_ERROR"
-                    # keep trying next attempt
+def attempts_for_hint(method_hint: str | None):
+    if method_hint == "GET":
+        # prioritize GET first
+        gets = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
+        posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
+        return gets + posts
+    if method_hint == "POST":
+        posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
+        gets  = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
+        return posts + gets
+    return DEFAULT_ATTEMPTS
+
+method_hint = None   # will be set to "GET" or "POST" after first 405 we see
+
+for code in sorted(codes):
+    safe_code = code[:3]+"…" if len(code)>3 else code
+
+    # build the attempt order for this code (method hint carries across FIDs)
+    ATTEMPTS = attempts_for_hint(method_hint)
+
+    for idx, fid in enumerate(sorted(roster.keys())):
+        status = "UNKNOWN"
+
+        for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in ATTEMPTS:
+            variant = {
+                "method": method, "order": order, "concat": concat,
+                "ts": ts_mode, "uppercase": upper, "lang": lang,
+                "body": body, "use_cookie": use_cookie
+            }
+
+            http, bodytxt = redeem_with_backoff(cookie_hdr, fid, code, variant)
+            try:
+                rg = json.loads(bodytxt); msg = (rg.get("msg") or "").upper()
+            except Exception:
+                msg = (bodytxt or "")[:100].upper()
+
+            # Auto-learn: if the very first attempt with this method returns 405, flip the hint
+            if http == 405:
+                # if we haven't chosen a hint yet, pick the opposite method globally
+                if method_hint is None:
+                    method_hint = "GET" if method == "POST" else "POST"
+                    if DEBUG:
+                        print(f"[DEBUG] Switching method_hint -> {method_hint} after 405")
+                    # rebuild attempts with the new hint and restart this FID with the new order
+                    ATTEMPTS = attempts_for_hint(method_hint)
                     continue
                 else:
-                    status = msg or f"HTTP_{http}"
-                    # stop on an explicit non-params message
-                    if status not in ("UNKNOWN","PARSE_ERROR"):
-                        break
+                    # already hinted; keep trying other variants
+                    continue
 
-            ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
-            ok_redeems += int(ok); fail_redeems += int(not ok)
-            redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
-            time.sleep(0.12)
+            if "SUCCESS" in msg:
+                status = "SUCCESS"; break
+            elif "RECEIVED" in msg:
+                status = "ALREADY"; break
+            elif "SAME TYPE EXCHANGE" in msg:
+                status = "SAME_TYPE"; break
+            elif "TIME ERROR" in msg:
+                status = "EXPIRED"; break
+            elif "CDK NOT FOUND" in msg:
+                status = "INVALID"; break
+            elif "PARAMS" in msg or "SIGN" in msg:
+                status = "SIGN ERROR" if "SIGN" in msg else "PARAMS_ERROR"
+                # keep trying next attempt
+                continue
+            else:
+                status = msg or f"HTTP_{http}"
+                # stop if it's a clear terminal message
+                if status not in ("UNKNOWN","PARSE_ERROR"):
+                    break
+
+        ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
+        ok_redeems += int(ok); fail_redeems += int(not ok)
+        redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
+
+        # global pacing to avoid 429
+        time.sleep(PACING)
+
 
     # ---- save next checkpoint/state back to Discord (attachment) ----
     new_state = {
