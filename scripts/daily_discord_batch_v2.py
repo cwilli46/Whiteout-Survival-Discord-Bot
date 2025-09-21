@@ -14,6 +14,10 @@ if not all([BOT_TOKEN, CODES_CH, IDS_CH, STATE_CH, WOS_SECRET]):
     print("Missing one of: DISCORD_BOT_TOKEN, DISCORD_CODES_CHANNEL_ID, DISCORD_IDS_CHANNEL_ID, DISCORD_STATE_CHANNEL_ID, WOS_SECRET")
     sys.exit(0)  # soft exit so workflow stays green for easier iteration
 
+def _short(s: str, n: int = 180) -> str:
+    s = s or ""
+    return (s[:n] + "…") if len(s) > n else s
+
 # ========== DISCORD REST ==========
 D_API = "https://discord.com/api/v10"
 D_HDR = {"Authorization": f"Bot {BOT_TOKEN}"}
@@ -26,7 +30,7 @@ def post_message(channel_id, content):
         timeout=20,
     )
     if not r.ok:
-        print(f"[ERR] Discord POST ch={channel_id} status={r.status_code} body={r.text[:200]}")
+        print(f"[ERR] Discord POST ch={channel_id} status={r.status_code} body={_short(r.text)}")
     return r.status_code
 
 def get_messages_after(channel_id, after_id=None, limit=100):
@@ -34,7 +38,7 @@ def get_messages_after(channel_id, after_id=None, limit=100):
     if after_id: params["after"] = str(after_id)
     r = requests.get(f"{D_API}/channels/{channel_id}/messages", headers=D_HDR, params=params, timeout=20)
     if not r.ok:
-        print(f"[ERR] Discord GET messages ch={channel_id} status={r.status_code} body={r.text[:200]}")
+        print(f"[ERR] Discord GET messages ch={channel_id} status={r.status_code} body={_short(r.text)}")
         return []
     try:
         return r.json()
@@ -50,7 +54,7 @@ def post_message_with_file(channel_id, content, filename, bytes_data):
                       data={"payload_json": json.dumps(payload)},
                       files=files, timeout=30)
     if not r.ok:
-        print(f"[ERR] Discord POST file ch={channel_id} status={r.status_code} body={r.text[:200]}")
+        print(f"[ERR] Discord POST file ch={channel_id} status={r.status_code} body={_short(r.text)}")
     return r.json() if r.ok else {}
 
 def delete_message(channel_id, message_id):
@@ -153,7 +157,6 @@ def build_sign(fid: str, cdk: str, ts_value: str, secret: str,
     if order == "sorted":
         items = sorted(pieces.items())
     else:
-        # fixed: keep insertion order fid,cdk,time,(lang)
         items = [(k, pieces[k]) for k in ("fid", "cdk", "time") if k in pieces]
         if "lang" in pieces: items.append(("lang","en"))
 
@@ -181,13 +184,16 @@ def post_form(url: str, form: dict, cookie: str | None, as_json=False):
     headers = {**BROWSER_HEADERS_BASE}
     if as_json:
         headers["Content-Type"] = "application/json"
-        data = json.dumps(form)
     else:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-        data = urlencode(form)
     if cookie: headers["Cookie"] = cookie
-    r = requests.post(url, headers=headers, data=None if as_json else data,
-                      json=form if as_json else None, timeout=20)
+    r = requests.post(
+        url,
+        headers=headers,
+        data=None if as_json else urlencode(form),
+        json=form if as_json else None,
+        timeout=20
+    )
     return r.status_code, r.text
 
 def get_form(url: str, params: dict, cookie: str | None):
@@ -232,10 +238,6 @@ def redeem_once(cookie_hdr: str, fid: str, code: str, variant: dict):
     method = variant.get("method","POST")
     body   = variant.get("body","form")  # 'form' or 'json'
     use_cookie = variant.get("use_cookie", True)
-
-    if DEBUG:
-        # Only print for first fid/code attempt to avoid noisy logs
-        pass
 
     if method == "POST":
         return post_form(GIFTCODE_URL, payload, cookie_hdr if use_cookie else None, as_json=(body=="json"))
@@ -340,130 +342,127 @@ try:
                 furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {rec.get('nickname') or ''}")
         furnace_snapshot.sort()
 
-# ---- redeem for all roster fids ----
-ok_redeems = fail_redeems = 0
-redeem_lines = []
+    # ---- redeem for all roster fids ----
+    ok_redeems = fail_redeems = 0
+    redeem_lines = []
 
-# pacing and backoff
-PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "1.25"))
+    # pacing and backoff
+    PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "1.25"))
 
-def redeem_with_backoff(cookie_hdr, fid, code, variant):
-    """Retry same variant when server says 429 (rate limited)."""
-    http, bodytxt = None, ""
-    for i in range(3):
-        http, bodytxt = redeem_once(cookie_hdr, fid, code, variant)
-        if http == 429:
-            # exponential backoff: 2s, 4s, 8s
-            time.sleep(2 ** (i + 1))
-            continue
-        break
-    return http, bodytxt
-
-# default attempt list; we'll re-order based on method_hint
-DEFAULT_ATTEMPTS = [
-    # method, order, concat, ts, uppercase, lang, body, use_cookie
-    ("POST","fixed","plain","s", False, False,"form", True),
-    ("POST","sorted","plain","s", False, False,"form", True),
-    ("POST","fixed","amp",  "s", False, False,"form", True),
-    ("POST","fixed","key",  "s", False, False,"form", True),
-    ("POST","fixed","prefix","s", False, False,"form", True),
-    ("POST","fixed","plain","ms",False, False,"form", True),
-    ("POST","fixed","plain","s", True,  False,"form", True),
-    ("POST","fixed","plain","s", False, True, "form", True),
-    ("POST","fixed","plain","s", False, False,"json", True),  # JSON body
-
-    # try without cookie once
-    ("POST","fixed","plain","s", False, False,"form", False),
-
-    # GET variants
-    ("GET","fixed","plain","s", False, False,"form", True),
-    ("GET","sorted","plain","s", False, False,"form", True),
-    ("GET","fixed","amp",  "s", False, False,"form", True),
-    ("GET","fixed","key",  "s", False, False,"form", True),
-    ("GET","fixed","prefix","s", False, False,"form", True),
-    ("GET","fixed","plain","ms",False, False,"form", True),
-    ("GET","fixed","plain","s", True,  False,"form", True),
-    ("GET","fixed","plain","s", False, True, "form", True),
-    ("GET","fixed","plain","s", False, False,"form", False),
-]
-
-def attempts_for_hint(method_hint: str | None):
-    if method_hint == "GET":
-        # prioritize GET first
-        gets = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
-        posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
-        return gets + posts
-    if method_hint == "POST":
-        posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
-        gets  = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
-        return posts + gets
-    return DEFAULT_ATTEMPTS
-
-method_hint = None   # will be set to "GET" or "POST" after first 405 we see
-
-for code in sorted(codes):
-    safe_code = code[:3]+"…" if len(code)>3 else code
-
-    # build the attempt order for this code (method hint carries across FIDs)
-    ATTEMPTS = attempts_for_hint(method_hint)
-
-    for idx, fid in enumerate(sorted(roster.keys())):
-        status = "UNKNOWN"
-
-        for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in ATTEMPTS:
-            variant = {
-                "method": method, "order": order, "concat": concat,
-                "ts": ts_mode, "uppercase": upper, "lang": lang,
-                "body": body, "use_cookie": use_cookie
-            }
-
-            http, bodytxt = redeem_with_backoff(cookie_hdr, fid, code, variant)
-            try:
-                rg = json.loads(bodytxt); msg = (rg.get("msg") or "").upper()
-            except Exception:
-                msg = (bodytxt or "")[:100].upper()
-
-            # Auto-learn: if the very first attempt with this method returns 405, flip the hint
-            if http == 405:
-                # if we haven't chosen a hint yet, pick the opposite method globally
-                if method_hint is None:
-                    method_hint = "GET" if method == "POST" else "POST"
-                    if DEBUG:
-                        print(f"[DEBUG] Switching method_hint -> {method_hint} after 405")
-                    # rebuild attempts with the new hint and restart this FID with the new order
-                    ATTEMPTS = attempts_for_hint(method_hint)
-                    continue
-                else:
-                    # already hinted; keep trying other variants
-                    continue
-
-            if "SUCCESS" in msg:
-                status = "SUCCESS"; break
-            elif "RECEIVED" in msg:
-                status = "ALREADY"; break
-            elif "SAME TYPE EXCHANGE" in msg:
-                status = "SAME_TYPE"; break
-            elif "TIME ERROR" in msg:
-                status = "EXPIRED"; break
-            elif "CDK NOT FOUND" in msg:
-                status = "INVALID"; break
-            elif "PARAMS" in msg or "SIGN" in msg:
-                status = "SIGN ERROR" if "SIGN" in msg else "PARAMS_ERROR"
-                # keep trying next attempt
+    def redeem_with_backoff(cookie_hdr, fid, code, variant):
+        """Retry same variant when server says 429 (rate limited)."""
+        http, bodytxt = None, ""
+        for i in range(3):
+            http, bodytxt = redeem_once(cookie_hdr, fid, code, variant)
+            if http == 429:
+                # exponential backoff: 2s, 4s, 8s
+                time.sleep(2 ** (i + 1))
                 continue
-            else:
-                status = msg or f"HTTP_{http}"
-                # stop if it's a clear terminal message
-                if status not in ("UNKNOWN","PARSE_ERROR"):
-                    break
+            break
+        return http, bodytxt
 
-        ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
-        ok_redeems += int(ok); fail_redeems += int(not ok)
-        redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
+    # default attempt list; we'll re-order based on method_hint
+    DEFAULT_ATTEMPTS = [
+        # method, order, concat, ts, uppercase, lang, body, use_cookie
+        ("POST","fixed","plain","s", False, False,"form", True),
+        ("POST","sorted","plain","s", False, False,"form", True),
+        ("POST","fixed","amp",  "s", False, False,"form", True),
+        ("POST","fixed","key",  "s", False, False,"form", True),
+        ("POST","fixed","prefix","s", False, False,"form", True),
+        ("POST","fixed","plain","ms",False, False,"form", True),
+        ("POST","fixed","plain","s", True,  False,"form", True),
+        ("POST","fixed","plain","s", False, True, "form", True),
+        ("POST","fixed","plain","s", False, False,"json", True),  # JSON body
 
-        # global pacing to avoid 429
-        time.sleep(PACING)
+        # try without cookie once
+        ("POST","fixed","plain","s", False, False,"form", False),
 
+        # GET variants
+        ("GET","fixed","plain","s", False, False,"form", True),
+        ("GET","sorted","plain","s", False, False,"form", True),
+        ("GET","fixed","amp",  "s", False, False,"form", True),
+        ("GET","fixed","key",  "s", False, False,"form", True),
+        ("GET","fixed","prefix","s", False, False,"form", True),
+        ("GET","fixed","plain","ms",False, False,"form", True),
+        ("GET","fixed","plain","s", True,  False,"form", True),
+        ("GET","fixed","plain","s", False, True, "form", True),
+        ("GET","fixed","plain","s", False, False,"form", False),
+    ]
+
+    def attempts_for_hint(method_hint: str | None):
+        if method_hint == "GET":
+            gets  = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
+            posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
+            return gets + posts
+        if method_hint == "POST":
+            posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
+            gets  = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
+            return posts + gets
+        return DEFAULT_ATTEMPTS
+
+    method_hint = None   # becomes "GET" or "POST" after first 405 we see
+
+    for code in sorted(codes):
+        safe_code = code[:3]+"…" if len(code)>3 else code
+
+        for fid in sorted(roster.keys()):
+            # allow restart of attempts if we flip method_hint on 405
+            while True:
+                ATTEMPTS = attempts_for_hint(method_hint)
+                status = "UNKNOWN"
+                flipped = False
+
+                for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in ATTEMPTS:
+                    variant = {
+                        "method": method, "order": order, "concat": concat,
+                        "ts": ts_mode, "uppercase": upper, "lang": lang,
+                        "body": body, "use_cookie": use_cookie
+                    }
+
+                    http, bodytxt = redeem_with_backoff(cookie_hdr, fid, code, variant)
+                    try:
+                        rg = json.loads(bodytxt); msg = (rg.get("msg") or "").upper()
+                    except Exception:
+                        msg = (bodytxt or "")[:120].upper()
+
+                    if DEBUG:
+                        print(f"[DEBUG] {fid} {code} => {method}/{order}/{concat}/{ts_mode} cookie={use_cookie} body={body} "
+                              f"HTTP {http} :: {msg or _short(bodytxt)}")
+
+                    # 405 => flip method family and restart attempts in new order
+                    if http == 405 and method_hint is None:
+                        method_hint = "GET" if method == "POST" else "POST"
+                        flipped = True
+                        break  # break inner-for, restart while with new ATTEMPTS
+
+                    if "SUCCESS" in msg:
+                        status = "SUCCESS"; break
+                    elif "RECEIVED" in msg:
+                        status = "ALREADY"; break
+                    elif "SAME TYPE EXCHANGE" in msg:
+                        status = "SAME_TYPE"; break
+                    elif "TIME ERROR" in msg:
+                        status = "EXPIRED"; break
+                    elif "CDK NOT FOUND" in msg:
+                        status = "INVALID"; break
+                    elif "PARAMS" in msg or "SIGN" in msg:
+                        status = "SIGN ERROR" if "SIGN" in msg else "PARAMS_ERROR"
+                        continue
+                    else:
+                        status = msg or f"HTTP_{http}"
+                        if status not in ("UNKNOWN","PARSE_ERROR"):
+                            break
+
+                if flipped:
+                    # restart loop with new ATTEMPTS order
+                    continue
+
+                # record and exit the while
+                ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
+                ok_redeems += int(ok); fail_redeems += int(not ok)
+                redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
+                time.sleep(PACING)
+                break  # end while for this fid
 
     # ---- save next checkpoint/state back to Discord (attachment) ----
     new_state = {
@@ -490,7 +489,7 @@ if 'added' in locals() and added:
 if 'codes' in locals() and codes:
     parts.append("**Codes processed**\n" + ", ".join(f"`{c}`" for c in sorted(codes)))
 if 'furnace_ups' in locals() and furnace_ups:
-    parts.append("**Furnace level ups**\n" + "\n".join(furnace_ups[:15]) + (" \n…" if len(furnace_ups)>15 else ""))
+    parts.append("**Furnace level ups**\n" + "\n".join(f"{x}" for x in furnace_ups[:15]) + (" \n…" if len(furnace_ups)>15 else ""))
 elif 'furnace_snapshot' in locals() and furnace_snapshot:
     parts.append("**Furnace levels (snapshot)**\n" + "\n".join(furnace_snapshot[:15]) + (" \n…" if len(furnace_snapshot)>15 else ""))
 if 'redeem_lines' in locals() and redeem_lines:
