@@ -369,3 +369,9 @@ if __name__ == "__main__":
 
     if __name__ == "__main__":
         asyncio.run(main())
+
+
+async def load_extensions():
+    # existing cogs...
+    await bot.load_extension("cogs.daily_batch")
+
