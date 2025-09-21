@@ -11,44 +11,6 @@ WOS_SECRET  = os.environ.get("WOS_SECRET", "").strip()
 if not all([BOT_TOKEN, CODES_CH, IDS_CH, WOS_SECRET]):
     print("Missing one of: DISCORD_BOT_TOKEN, DISCORD_CODES_CHANNEL_ID, DISCORD_IDS_CHANNEL_ID, WOS_SECRET")
     sys.exit(1)
-#====== Helpers ======
-def sign_sorted(form: dict, secret: str) -> str:
-    # alphabetical by key
-    items = sorted((k, str(v)) for k, v in form.items())
-    base  = "&".join([f"{k}={v}" for k, v in items])
-    return md5(base + secret)
-
-def sign_fixed(fid: str, cdk: str, ts: str, secret: str) -> str:
-    # exact order expected by some deployments: fid, cdk, time
-    base = f"fid={fid}&cdk={cdk}&time={ts}"
-    return md5(base + secret)
-
-BROWSER_HEADERS_BASE = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://wos-giftcode.centurygame.com",
-    "Referer": "https://wos-giftcode.centurygame.com/",
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-}
-
-def redeem_attempt(session, cookie_hdr: str, fid: str, code: str, sign_func, method: str):
-    ts = str(int(time.time()))
-    payload = {"fid": fid, "cdk": code, "time": ts, "sign": sign_func(fid, code, ts, WOS_SECRET)}
-    headers = {**BROWSER_HEADERS_BASE, "Cookie": cookie_hdr} if cookie_hdr else dict(BROWSER_HEADERS_BASE)
-
-    if method == "POST":
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        r = requests.post(GIFTCODE_URL, headers=headers, data=urlencode(payload), timeout=20)
-    else:  # GET
-        r = requests.get(GIFTCODE_URL, headers=headers, params=payload, timeout=20)
-
-    try:
-        js = r.json()
-    except Exception:
-        return r.status_code, "PARSE_ERROR", r.text[:200]
-    msg = (js.get("msg") or "").upper()
-    return r.status_code, msg or "UNKNOWN", js
-
 
 # ====== DISCORD REST ======
 D_API = "https://discord.com/api/v10"
@@ -148,6 +110,55 @@ def sign_sorted(form: dict, secret: str) -> str:
     items = sorted((k, str(v)) for k,v in form.items())
     base  = "&".join([f"{k}={v}" for k,v in items])
     return md5(base + secret)
+
+# --- added helpers for redeem robustness ---
+
+def sign_fixed(fid: str, cdk: str, ts: str, secret: str) -> str:
+    """
+    Some deployments expect sign() over EXACT ORDER: fid,cdk,time
+    """
+    base = f"fid={fid}&cdk={cdk}&time={ts}"
+    return md5(base + secret)
+
+def sign_sorted_kct(fid: str, cdk: str, ts: str, secret: str) -> str:
+    """
+    Keep alphabetical sort, but over the redeem triad {cdk,fid,time}
+    """
+    return sign_sorted({"cdk": cdk, "fid": fid, "time": ts}, secret)
+
+BROWSER_HEADERS_BASE = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://wos-giftcode.centurygame.com",
+    "Referer": "https://wos-giftcode.centurygame.com/",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+}
+
+def redeem_attempt(cookie_hdr: str, fid: str, code: str, sign_func, method: str):
+    """
+    Try one request style (POST/GET) with a given signing function.
+    Returns: (http_status:int, msg_upper:str, raw_or_json:any)
+    """
+    ts = str(int(time.time()))
+    payload = {"fid": fid, "cdk": code, "time": ts, "sign": sign_func(fid, code, ts, WOS_SECRET)}
+    headers = {**BROWSER_HEADERS_BASE}
+    if cookie_hdr:
+        headers["Cookie"] = cookie_hdr
+
+    if method == "POST":
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        r = requests.post(GIFTCODE_URL, headers=headers, data=urlencode(payload), timeout=20)
+    else:  # GET
+        r = requests.get(GIFTCODE_URL, headers=headers, params=payload, timeout=20)
+
+    try:
+        js = r.json()
+        msg = (js.get("msg") or "").upper()
+        return r.status_code, msg or "UNKNOWN", js
+    except Exception:
+        return r.status_code, "PARSE_ERROR", r.text[:200]
+# --- end added helpers ---
+
 
 def post_form(url: str, form: dict, cookie: str | None):
     headers = {
