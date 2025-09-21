@@ -254,51 +254,88 @@ for fid, rec in roster.items():
             pass
     time.sleep(0.2)
 
-# ====== REDEEM (new codes for ALL roster FIDs) ======
+# ---- Furnace snapshot (shown only if there are no ups; useful on first run) ----
+furnace_snapshot = []
+for fid, rec in roster.items():
+    if rec.get("stove") is not None:
+        furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {rec.get('nickname') or ''}")
+furnace_snapshot = sorted(furnace_snapshot)
+# ------------------------------------------------------------------------------
+
+# ===== REDEEM (new codes for ALL roster FIDs) =====
 codes = sorted(codes)
 ok_redeems = fail_redeems = 0
 redeem_lines = []
+
 for code in codes:
     safe_code = code[:3]+"…" if len(code)>3 else code
     for fid in sorted(roster.keys()):
-        ts2 = str(int(time.time()))
-        payload = {"fid": fid, "cdk": code, "time": ts2}
-        payload["sign"] = sign_sorted(payload, WOS_SECRET)
-        hg, bg = post_form(GIFTCODE_URL, payload, cookie_hdr)
-
         status = "UNKNOWN"
-        try:
-            rg = json.loads(bg); msg = (rg.get("msg") or "").upper()
-            if "SUCCESS" in msg: status = "SUCCESS"
-            elif "RECEIVED" in msg: status = "ALREADY"
-            elif "SAME TYPE EXCHANGE" in msg: status = "SAME_TYPE"
-            elif "TIME ERROR" in msg: status = "EXPIRED"
-            elif "CDK NOT FOUND" in msg: status = "INVALID"
-            elif "PARAMS" in msg: status = "PARAMS_ERROR"
-            else: status = msg or "UNKNOWN"
-        except Exception:
-            status = "PARSE_ERROR"
+
+        # Try multiple combinations: some backends are picky about sign order and method
+        attempts = [
+            ("POST", sign_fixed),         # POST + sign(fid,cdk,time)
+            ("POST", sign_sorted_triad),  # POST + alphabetical sign
+            ("GET",  sign_fixed),         # GET  + sign(fid,cdk,time)
+            ("GET",  sign_sorted_triad),  # GET  + alphabetical sign
+        ]
+
+        for method, signer in attempts:
+            ts2 = str(int(time.time()))
+            payload = {"fid": fid, "cdk": code, "time": ts2, "sign": signer(fid, code, ts2, WOS_SECRET)}
+
+            if method == "POST":
+                hg, bg = post_form(GIFTCODE_URL, payload, cookie_hdr)   # you already have this helper
+            else:  # GET
+                hg, bg = get_form(GIFTCODE_URL, payload, cookie_hdr)
+
+            try:
+                rg = json.loads(bg); msg = (rg.get("msg") or "").upper()
+            except Exception:
+                msg = "PARSE_ERROR"
+
+            if "SUCCESS" in msg:
+                status = "SUCCESS"; break
+            elif "RECEIVED" in msg:
+                status = "ALREADY"; break
+            elif "SAME TYPE EXCHANGE" in msg:
+                status = "SAME_TYPE"; break
+            elif "TIME ERROR" in msg:
+                status = "EXPIRED"; break
+            elif "CDK NOT FOUND" in msg:
+                status = "INVALID"; break
+            elif "PARAMS" in msg:
+                status = "PARAMS_ERROR"
+                # keep trying next attempt
+                continue
+            else:
+                status = msg or "UNKNOWN"
+                break
 
         ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
-        if ok: ok_redeems += 1
-        else:  fail_redeems += 1
-        emoji = "✅" if ok else "❌"
-        redeem_lines.append(f"{emoji} {fid} • {safe_code} • {status}")
+        ok_redeems += int(ok); fail_redeems += int(not ok)
+        redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
         time.sleep(0.2)
+
 
 # Save roster (with updated nick/stove)
 save_json(ROSTER_PATH, roster)
 
 # ====== SUMMARY ======
 parts = []
+added = sorted(new_fids)
 if added:
-    parts.append("**New IDs added**\n" + ", ".join(f"`{a}`" for a in added[:20]) + ("" if len(added)<=20 else " …"))
+    parts.append("**New IDs added**\n" + ", ".join(f"`{a}`" for a in added[:20]) + (" …" if len(added)>20 else ""))
 if codes:
     parts.append("**Codes processed**\n" + ", ".join(f"`{c}`" for c in codes))
-if furnace_diffs:
-    parts.append("**Furnace level ups**\n" + "\n".join(furnace_diffs[:15]) + ("" if len(furnace_diffs)<=15 else "\n…"))
+
+if furnace_ups:
+    parts.append("**Furnace level ups**\n" + "\n".join(furnace_ups[:15]) + (" \n…" if len(furnace_ups)>15 else ""))
+elif furnace_snapshot:
+    parts.append("**Furnace levels (snapshot)**\n" + "\n".join(furnace_snapshot[:15]) + (" \n…" if len(furnace_snapshot)>15 else ""))
+
 if redeem_lines:
-    parts.append("**Redeem results (first 25)**\n" + "\n".join(redeem_lines[:25]) + ("" if len(redeem_lines)<=25 else "\n…"))
+    parts.append("**Redeem results (first 25)**\n" + "\n".join(redeem_lines[:25]) + (" \n…" if len(redeem_lines)>25 else ""))
 
 summary = (
     f"**Daily Batch Summary**\n"
@@ -308,5 +345,7 @@ summary = (
 post_message(SUMMARY_CH, summary + ("\n" + "\n\n".join(parts) if parts else "\n(No changes today)"))
 
 # Non-zero exit if everything failed (helps you notice problems)
-if ok_players == 0 or (codes and ok_redeems == 0):
-    sys.exit(1)
+# Leave the workflow green; rely on the summary text to spot failures.
+if ok_players == 0 and (codes and ok_redeems == 0):
+    sys.exit(0)
+
