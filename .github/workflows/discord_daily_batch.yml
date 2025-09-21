@@ -2,19 +2,20 @@ name: Discord-driven daily batch
 
 on:
   schedule:
-    - cron: "0 08 * * *"     # daily 08:00 UTC, change as needed
+    - cron: "0 08 * * *"   # daily at 08:00 UTC; change as needed
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     concurrency:
       group: discord-daily-batch
       cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -25,11 +26,22 @@ jobs:
           pip install requests playwright
           python -m playwright install --with-deps chromium
 
+      - name: Preflight env echo (redacted)
+        run: |
+          python - <<'PY'
+          import os
+          for k in ["DISCORD_BOT_TOKEN","DISCORD_CODES_CHANNEL_ID","DISCORD_IDS_CHANNEL_ID","DISCORD_STATE_CHANNEL_ID","WOS_SECRET"]:
+              v = os.environ.get(k,"")
+              print(f"{k}={'set' if v else 'MISSING'}")
+          PY
+
       - name: Run daily job
         env:
-          DISCORD_BOT_TOKEN:         ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_CODES_CHANNEL_ID:  ${{ secrets.DISCORD_CODES_CHANNEL_ID }}   # #gift_code_axe
-          DISCORD_IDS_CHANNEL_ID:    ${{ secrets.DISCORD_IDS_CHANNEL_ID }}     # #3349_axe
-          DISCORD_STATE_CHANNEL_ID:  ${{ secrets.DISCORD_STATE_CHANNEL_ID }}   # #wosbot_state
-          WOS_SECRET:                ${{ secrets.WOS_SECRET }}
-        run: python scripts/daily_discord_batch.py
+          DISCORD_BOT_TOKEN:        ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CODES_CHANNEL_ID: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}   # #gift_code_axe
+          DISCORD_IDS_CHANNEL_ID:   ${{ secrets.DISCORD_IDS_CHANNEL_ID }}     # #3349_axe
+          DISCORD_STATE_CHANNEL_ID: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}   # private admin/state channel
+          WOS_SECRET:               ${{ secrets.WOS_SECRET }}
+          DEBUG: "1"
+        run: |
+          python scripts/daily_discord_batch_v2.py
