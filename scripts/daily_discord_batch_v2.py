@@ -6,7 +6,7 @@ from playwright.sync_api import sync_playwright
 BOT_TOKEN  = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 CODES_CH   = os.environ.get("DISCORD_CODES_CHANNEL_ID", "").strip()
 IDS_CH     = os.environ.get("DISCORD_IDS_CHANNEL_ID", "").strip()
-STATE_CH   = os.environ.get("DISCORD_STATE_CHANNEL_ID", "").strip()  # also used for summaries
+STATE_CH   = os.environ.get("DISCORD_STATE_CHANNEL_ID", "").strip()   # also used for summaries
 WOS_SECRET = os.environ.get("WOS_SECRET", "").strip()
 DEBUG      = os.environ.get("DEBUG","0") == "1"
 
@@ -64,7 +64,7 @@ def find_latest_state_message(channel_id, bot_user_id):
     if not r.ok:
         return None, {}
     for m in r.json():  # newest first
-        if str(m.get("author",{}).get("id")) != str(bot_user_id): 
+        if str(m.get("author",{}).get("id")) != str(bot_user_id):
             continue
         for att in m.get("attachments", []):
             if att.get("filename") == "wos_state.json":
@@ -133,12 +133,41 @@ def sign_sorted(form: dict, secret: str) -> str:
     base  = "&".join([f"{k}={v}" for k, v in items])
     return md5(base + secret)
 
-def sign_fixed(fid: str, cdk: str, ts: str, secret: str) -> str:
-    base = f"fid={fid}&cdk={cdk}&time={ts}"
-    return md5(base + secret)
+# ---- generic signer to cover many server variants ----
+def build_sign(fid: str, cdk: str, ts_value: str, secret: str,
+               order="fixed", concat="plain", uppercase=False, include_lang=False):
+    """
+    order: 'fixed' -> fid,cdk,time,(lang?)
+           'sorted'-> alphabetical over present keys
+    concat: 'plain' -> + secret
+            'amp'   -> + '&' + secret
+            'key'   -> + '&key=' + secret
+            'prefix'-> secret + base
+    uppercase: bool -> MD5 hex uppercase
+    include_lang: bool -> include lang=en in both payload and base
+    """
+    pieces = {"fid": fid, "cdk": cdk, "time": ts_value}
+    if include_lang:
+        pieces["lang"] = "en"
 
-def sign_sorted_triad(fid: str, cdk: str, ts: str, secret: str) -> str:
-    return sign_sorted({"cdk": cdk, "fid": fid, "time": ts}, secret)
+    if order == "sorted":
+        items = sorted(pieces.items())
+    else:
+        # fixed: keep insertion order fid,cdk,time,(lang)
+        items = [(k, pieces[k]) for k in ("fid", "cdk", "time") if k in pieces]
+        if "lang" in pieces: items.append(("lang","en"))
+
+    base = "&".join(f"{k}={v}" for k, v in items)
+    if concat == "amp":
+        s = base + "&" + secret
+    elif concat == "key":
+        s = base + "&key=" + secret
+    elif concat == "prefix":
+        s = secret + base
+    else:
+        s = base + secret
+    digest = hashlib.md5(s.encode("utf-8")).hexdigest()
+    return digest.upper() if uppercase else digest
 
 BROWSER_HEADERS_BASE = {
     "Accept": "application/json, text/plain, */*",
@@ -148,13 +177,17 @@ BROWSER_HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
 }
 
-def post_form(url: str, form: dict, cookie: str | None):
-    headers = {
-        **BROWSER_HEADERS_BASE,
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+def post_form(url: str, form: dict, cookie: str | None, as_json=False):
+    headers = {**BROWSER_HEADERS_BASE}
+    if as_json:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(form)
+    else:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        data = urlencode(form)
     if cookie: headers["Cookie"] = cookie
-    r = requests.post(url, headers=headers, data=urlencode(form), timeout=20)
+    r = requests.post(url, headers=headers, data=None if as_json else data,
+                      json=form if as_json else None, timeout=20)
     return r.status_code, r.text
 
 def get_form(url: str, params: dict, cookie: str | None):
@@ -165,14 +198,18 @@ def get_form(url: str, params: dict, cookie: str | None):
 
 def get_cookie_header():
     print("Acquiring site cookie via headless Chromium…")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context()
-        page = ctx.new_page()
-        page.goto(REFERER, wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(3000)
-        cookies = ctx.cookies()
-        browser.close()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context()
+            page = ctx.new_page()
+            page.goto(REFERER, wait_until="networkidle", timeout=45000)
+            page.wait_for_timeout(2500)
+            cookies = ctx.cookies()
+            browser.close()
+    except Exception:
+        print("[WARN] Playwright failed; continuing without cookie")
+        cookies = []
     pairs = []
     for c in cookies:
         domain = (c.get("domain") or "").lstrip(".")
@@ -180,13 +217,30 @@ def get_cookie_header():
             pairs.append(f"{c['name']}={c['value']}")
     return "; ".join(pairs)
 
-def redeem_attempt(cookie_hdr: str, fid: str, code: str, sign_func, method: str):
-    ts = str(int(time.time()))
-    payload = {"fid": fid, "cdk": code, "time": ts, "sign": sign_func(fid, code, ts, WOS_SECRET)}
+# Single redeem attempt with a specified variant
+def redeem_once(cookie_hdr: str, fid: str, code: str, variant: dict):
+    ts_value = str(int(time.time() * 1000)) if variant.get("ts") == "ms" else str(int(time.time()))
+    sign = build_sign(fid, code, ts_value, WOS_SECRET,
+                      order=variant.get("order","fixed"),
+                      concat=variant.get("concat","plain"),
+                      uppercase=variant.get("uppercase", False),
+                      include_lang=variant.get("lang", False))
+    payload = {"fid": fid, "cdk": code, "time": ts_value, "sign": sign}
+    if variant.get("lang", False):
+        payload["lang"] = "en"
+
+    method = variant.get("method","POST")
+    body   = variant.get("body","form")  # 'form' or 'json'
+    use_cookie = variant.get("use_cookie", True)
+
+    if DEBUG:
+        # Only print for first fid/code attempt to avoid noisy logs
+        pass
+
     if method == "POST":
-        return post_form(GIFTCODE_URL, payload, cookie_hdr)
+        return post_form(GIFTCODE_URL, payload, cookie_hdr if use_cookie else None, as_json=(body=="json"))
     else:
-        return get_form(GIFTCODE_URL, payload, cookie_hdr)
+        return get_form(GIFTCODE_URL, payload, cookie_hdr if use_cookie else None)
 
 # ========== MAIN ==========
 had_unhandled_error = False
@@ -195,15 +249,14 @@ startup_rc = post_message(STATE_CH, "🟢 WOS daily run starting…")
 print(f"[INFO] Startup ping HTTP={startup_rc}")
 
 try:
+    # ---- load state from Discord ----
     bot_id = get_me()
-
-    # Load last state (from Discord attachment), else fresh
     prev_state_msg_id, state = find_latest_state_message(STATE_CH, bot_id)
     last_codes = int(state.get("last_id_codes") or 0)
     last_ids   = int(state.get("last_id_ids") or 0)
     roster     = state.get("roster") or {}   # {fid: {nickname, stove, updated_at}}
 
-    # Read codes since last checkpoint
+    # ---- read codes since last checkpoint ----
     msgs_codes = get_messages_after(CODES_CH, last_codes)
     codes = set()
     for m in msgs_codes:
@@ -211,9 +264,9 @@ try:
         codes |= parse_codes(txt)
         for t in fetch_text_attachments(m):
             codes |= parse_codes(t)
-        last_codes = max(last_codes, int(m["id"]))
+        last_codes = max(last_codes, int(m["id"]))  # advance pointer even if no codes in this msg
 
-    # Read FIDs since last checkpoint
+    # ---- read fids since last checkpoint ----
     msgs_ids = get_messages_after(IDS_CH, last_ids)
     new_fids = set()
     for m in msgs_ids:
@@ -223,14 +276,14 @@ try:
             new_fids |= parse_fids(t)
         last_ids = max(last_ids, int(m["id"]))
 
-    # Update roster
+    # ---- update roster ----
     added = []
     for fid in sorted(new_fids):
         if fid not in roster:
             roster[fid] = {"nickname": None, "stove": None, "updated_at": None}
             added.append(fid)
 
-    # Furnace scan
+    # ---- furnace scan ----
     cookie_hdr = get_cookie_header()
     print("Cookie:", "[present]" if cookie_hdr else "[none]")
 
@@ -238,8 +291,9 @@ try:
     furnace_ups = []
     for fid, rec in roster.items():
         ts = str(int(time.time()))
-        payload = {"fid": fid, "time": ts, "sign": sign_sorted({"fid": fid, "time": ts}, WOS_SECRET)}
-        hp, bp = post_form(PLAYER_URL, payload, cookie=None)
+        # player endpoint typically uses sorted signature without cookie
+        sign_p = sign_sorted({"fid": fid, "time": ts}, WOS_SECRET)
+        hp, bp = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p}, cookie=None)
         try:
             js = json.loads(bp)
         except Exception:
@@ -257,9 +311,28 @@ try:
                     furnace_ups.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
             except Exception:
                 pass
-        time.sleep(0.15)
+        else:
+            # Some deployments want cookie here too; try once more with cookie if first failed
+            hp2, bp2 = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p}, cookie_hdr or None)
+            try:
+                js2 = json.loads(bp2)
+            except Exception:
+                js2 = {}
+            if hp2 == 200 and js2.get("msg") == "success":
+                ok_players += 1
+                data = js2.get("data", {})
+                nick  = data.get("nickname")
+                stove = data.get("stove_lv")
+                prev  = rec.get("stove")
+                rec.update({"nickname": nick, "stove": stove, "updated_at": int(time.time())})
+                try:
+                    if prev is not None and stove is not None and int(stove) > int(prev):
+                        furnace_ups.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
+                except Exception:
+                    pass
+        time.sleep(0.1)
 
-    # Snapshot if no ups (first run)
+    # ---- snapshot if no ups ----
     furnace_snapshot = []
     if not furnace_ups:
         for fid, rec in roster.items():
@@ -267,26 +340,58 @@ try:
                 furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {rec.get('nickname') or ''}")
         furnace_snapshot.sort()
 
-    # Redeem for all roster FIDs
+    # ---- redeem for all roster fids ----
     ok_redeems = fail_redeems = 0
     redeem_lines = []
+
+    # attempt matrix covering common variants
+    ATTEMPTS = [
+        # method, order, concat, ts, uppercase, lang, body, use_cookie
+        # POST first (most common)
+        ("POST","fixed","plain","s", False, False,"form", True),
+        ("POST","sorted","plain","s", False, False,"form", True),
+        ("POST","fixed","amp",  "s", False, False,"form", True),
+        ("POST","fixed","key",  "s", False, False,"form", True),
+        ("POST","fixed","prefix","s", False, False,"form", True),
+        ("POST","fixed","plain","ms",False, False,"form", True),
+        ("POST","fixed","plain","s", True,  False,"form", True),
+        ("POST","fixed","plain","s", False, True, "form", True),
+
+        # try again without cookie (some WAFs dislike it)
+        ("POST","fixed","plain","s", False, False,"form", False),
+
+        # JSON body (rare but seen)
+        ("POST","fixed","plain","s", False, False,"json", True),
+
+        # GET variants
+        ("GET","fixed","plain","s", False, False,"form", True),
+        ("GET","sorted","plain","s", False, False,"form", True),
+        ("GET","fixed","amp",  "s", False, False,"form", True),
+        ("GET","fixed","key",  "s", False, False,"form", True),
+        ("GET","fixed","prefix","s", False, False,"form", True),
+        ("GET","fixed","plain","ms",False, False,"form", True),
+        ("GET","fixed","plain","s", True,  False,"form", True),
+        ("GET","fixed","plain","s", False, True, "form", True),
+        ("GET","fixed","plain","s", False, False,"form", False),
+    ]
+
     for code in sorted(codes):
         safe_code = code[:3]+"…" if len(code)>3 else code
         for fid in sorted(roster.keys()):
             status = "UNKNOWN"
-            attempts = [
-                ("POST", sign_fixed),
-                ("POST", sign_sorted_triad),
-                ("GET",  sign_fixed),
-                ("GET",  sign_sorted_triad),
-            ]
-            for method, signer in attempts:
-                hg, bg = redeem_attempt(cookie_hdr, fid, code, signer, method)
+            for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in ATTEMPTS:
+                variant = {
+                    "method": method, "order": order, "concat": concat,
+                    "ts": ts_mode, "uppercase": upper, "lang": lang,
+                    "body": body, "use_cookie": use_cookie
+                }
+                http, bodytxt = redeem_once(cookie_hdr, fid, code, variant)
                 try:
-                    rg = json.loads(bg); msg = (rg.get("msg") or "").upper()
+                    rg = json.loads(bodytxt); msg = (rg.get("msg") or "").upper()
                 except Exception:
-                    msg = "PARSE_ERROR"
+                    msg = (bodytxt or "")[:80].upper()
 
+                # Normalize and decide whether to stop trying
                 if "SUCCESS" in msg:
                     status = "SUCCESS"; break
                 elif "RECEIVED" in msg:
@@ -297,17 +402,22 @@ try:
                     status = "EXPIRED"; break
                 elif "CDK NOT FOUND" in msg:
                     status = "INVALID"; break
-                elif "PARAMS" in msg:
-                    status = "PARAMS_ERROR"; continue
+                elif "PARAMS" in msg or "SIGN" in msg:
+                    status = "SIGN ERROR" if "SIGN" in msg else "PARAMS_ERROR"
+                    # keep trying next attempt
+                    continue
                 else:
-                    status = msg or "UNKNOWN"; break
+                    status = msg or f"HTTP_{http}"
+                    # stop on an explicit non-params message
+                    if status not in ("UNKNOWN","PARSE_ERROR"):
+                        break
 
             ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
             ok_redeems += int(ok); fail_redeems += int(not ok)
             redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
-            time.sleep(0.15)
+            time.sleep(0.12)
 
-    # Save next checkpoint/state back to Discord (attachment)
+    # ---- save next checkpoint/state back to Discord (attachment) ----
     new_state = {
         "last_id_codes": str(last_codes),
         "last_id_ids":   str(last_ids),
@@ -325,7 +435,7 @@ except Exception as e:
     print("[FATAL] Unhandled exception. Traceback follows:")
     traceback.print_exc()
 
-# Summary post (always try)
+# ========== SUMMARY (always try) ==========
 parts = []
 if 'added' in locals() and added:
     parts.append("**New IDs added**\n" + ", ".join(f"`{a}`" for a in added[:20]) + (" …" if len(added)>20 else ""))
@@ -338,8 +448,8 @@ elif 'furnace_snapshot' in locals() and furnace_snapshot:
 if 'redeem_lines' in locals() and redeem_lines:
     parts.append("**Redeem results (first 25)**\n" + "\n".join(redeem_lines[:25]) + (" \n…" if len(redeem_lines)>25 else ""))
 
-ok_players = locals().get("ok_players", 0)
-ok_redeems = locals().get("ok_redeems", 0)
+ok_players   = locals().get("ok_players", 0)
+ok_redeems   = locals().get("ok_redeems", 0)
 fail_redeems = locals().get("fail_redeems", 0)
 
 summary = (
@@ -353,5 +463,5 @@ if had_unhandled_error and error_summary:
 rc = post_message(STATE_CH, summary + ("\n" + "\n\n".join(parts) if parts else "\n(No changes)"))
 print(f"[INFO] Posted summary HTTP={rc}")
 
-# Keep workflow green while you iterate; you can still spot issues in the summary/logs
+# Keep workflow green while you iterate; inspect summary/logs for issues
 sys.exit(0)
