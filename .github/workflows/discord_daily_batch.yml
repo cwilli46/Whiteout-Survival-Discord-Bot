@@ -1,51 +1,75 @@
-name: WOS Daily (Discord • Free OCR)
+name: WOS Daily Discord Batch (OCR)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 8 * * *"   # 08:00 UTC daily
-
-permissions:
-  contents: read
+    # 08:00 UTC daily — change if you like
+    - cron: "0 8 * * *"
 
 concurrency:
-  group: wos-daily
+  group: wos-daily-discord
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
-
-    env:
-      REDEEM_PACING_SECONDS: "1.8"   # tune to 2.0–2.5 if you still see 429s
-      DEBUG: "1"
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
-      - name: System deps for OCR
+      - name: Install system deps (Tesseract OCR)
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr libtesseract-dev
+          fc-cache -f -v || true
 
-      - name: Install Python deps (Requests + Playwright + OCR stack)
+      - name: Install Python deps (requests + OCR + Playwright)
         run: |
           python -m pip install --upgrade pip
-          pip install requests playwright pillow pytesseract easyocr \
-            torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install requests pillow pytesseract easyocr playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run daily job (free OCR)
-        env:
-          DISCORD_BOT_TOKEN:           ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_CODES_CHANNEL_ID:    ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
-          DISCORD_IDS_CHANNEL_ID:      ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
-          DISCORD_STATE_CHANNEL_ID:    ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
-          WOS_SECRET:                  ${{ secrets.WOS_SECRET }}
+      - name: Preflight env (redacted)
         run: |
-          python scripts/daily_discord_batch_solver_free.py
+          echo "Python: $(python --version)"
+          echo "Bot token set:         ${{ secrets.DISCORD_BOT_TOKEN != '' }}"
+          echo "Codes channel set:     ${{ secrets.DISCORD_CODES_CHANNEL_ID != '' }}"
+          echo "IDs channel set:       ${{ secrets.DISCORD_IDS_CHANNEL_ID != '' }}"
+          echo "State channel set:     ${{ secrets.DISCORD_STATE_CHANNEL_ID != '' }}"
+          echo "WOS secret set:        ${{ secrets.WOS_SECRET != '' }}"
+
+      - name: Locate script
+        id: findscript
+        shell: bash
+        run: |
+          set -e
+          SCRIPT=$(git ls-files 'scripts/daily_discord_batch*.py' | head -n1 || true)
+          if [[ -z "$SCRIPT" ]]; then
+            echo "No scripts/daily_discord_batch*.py found"; exit 1
+          fi
+          echo "SCRIPT_PATH=$SCRIPT" >> $GITHUB_ENV
+          echo "Found script: $SCRIPT"
+
+      - name: Run daily job
+        env:
+          DISCORD_BOT_TOKEN:        ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CODES_CHANNEL_ID: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
+          DISCORD_IDS_CHANNEL_ID:   ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
+          DISCORD_STATE_CHANNEL_ID: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
+          WOS_SECRET:               ${{ secrets.WOS_SECRET }}
+          # Optional repo vars to tweak behavior without editing code
+          REDEEM_PACING_SECONDS:    ${{ vars.REDEEM_PACING_SECONDS || '2.3' }}
+          DEBUG:                    ${{ vars.DEBUG || '0' }}
+        run: |
+          set -e
+          python "$SCRIPT_PATH"
