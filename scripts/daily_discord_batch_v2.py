@@ -135,21 +135,41 @@ def sign_sorted(form: dict, secret: str) -> str:
     base  = "&".join([f"{k}={v}" for k, v in items])
     return md5(base + secret)
 
-def build_sign(fid: str, cdk: str, ts_value: str, secret: str,
-               order="fixed", concat="plain", uppercase=False, include_lang=False):
+# ---- flexible signer covering multiple server recipes ----
+def build_sign(
+    fid: str, cdk: str, ts_value: str, secret: str,
+    order: str = "fixed", concat: str = "plain", uppercase: bool = False,
+    include_lang: bool = False, order_seq: list | None = None
+):
+    """
+    order: 'fixed' keeps (fid, cdk, time[, lang]),
+           'sorted' alphabetical over keys,
+           or provide order_seq like ['cdk','fid','time'].
+    concat: 'plain' -> + SECRET
+            'amp'   -> + '&' + SECRET
+            'key'   -> + '&key=' + SECRET
+            'prefix'-> SECRET + base
+    """
     pieces = {"fid": fid, "cdk": cdk, "time": ts_value}
     if include_lang:
         pieces["lang"] = "en"
-    if order == "sorted":
+
+    if order_seq:
+        items = [(k, pieces[k]) for k in order_seq if k in pieces]
+        if "lang" in pieces: items.append(("lang", "en"))
+    elif order == "sorted":
         items = sorted(pieces.items())
     else:
-        items = [(k, pieces[k]) for k in ("fid","cdk","time") if k in pieces]
-        if "lang" in pieces: items.append(("lang","en"))
-    base = "&".join(f"{k}={v}" for k,v in items)
+        items = [("fid", fid), ("cdk", cdk), ("time", ts_value)]
+        if "lang" in pieces: items.append(("lang", "en"))
+
+    base = "&".join(f"{k}={v}" for k, v in items)
+
     if   concat == "amp":    s = base + "&" + secret
     elif concat == "key":    s = base + "&key=" + secret
     elif concat == "prefix": s = secret + base
     else:                    s = base + secret
+
     d = hashlib.md5(s.encode("utf-8")).hexdigest()
     return d.upper() if uppercase else d
 
@@ -157,10 +177,8 @@ def build_sign(fid: str, cdk: str, ts_value: str, secret: str,
 def new_browser_context(p):
     ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
     ctx = p.chromium.launch(headless=True).new_context(user_agent=ua)
-    # tiny stealth: hide webdriver flag
     ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
     page = ctx.new_page()
-    # Hit the web site first (sets base cookies), then the API URL (so the API host issues clearance)
     page.goto(WEB_REFERER, wait_until="networkidle", timeout=45000)
     page.wait_for_timeout(2500)
     try:
@@ -171,7 +189,6 @@ def new_browser_context(p):
     return ctx, page
 
 def fetch_from_page(page, url, method, payload):
-    """Runs window.fetch in the page so the page’s cookies/headers are used."""
     script = """
       async ({url, method, payload}) => {
         const enc = new URLSearchParams(payload).toString();
@@ -233,7 +250,7 @@ try:
             roster[fid] = {"nickname": None, "stove": None, "updated_at": None}
             added.append(fid)
 
-    # ---- player scan (HTTP via requests is fine here) ----
+    # ---- player scan ----
     def post_form(url: str, form: dict):
         headers = {
             "Accept": "application/json, text/plain, */*",
@@ -278,19 +295,28 @@ try:
                 furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {rec.get('nickname') or ''}")
         furnace_snapshot.sort()
 
-    # ---- redeem inside a browser context to satisfy WAF ----
-    PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "6.0"))  # slow by default
+    # ---- redeem inside browser context (beats WAF) with extended sign variants ----
+    PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "6.0"))
     ok_redeems = fail_redeems = 0
     redeem_lines = []
 
-    # signer variants (kept small; browser context usually removes need for many)
-    VARIANTS = [
-        # method, order, concat, ts, uppercase, lang
-        ("POST","fixed","plain","s", False, False),
-        ("GET", "fixed","plain","s", False, False),
-        ("POST","sorted","plain","s", False, False),
-        ("GET", "sorted","plain","s", False, False),
-        ("POST","fixed","plain","ms",False, False),
+    # (method, order, concat, ts_mode, uppercase, lang, order_seq)
+    BASE_VARIANTS = [
+        ("POST","fixed","plain","s",  False, False, None),
+        ("GET", "fixed","plain","s",  False, False, None),
+        ("POST","sorted","plain","s", False, False, None),
+        ("GET", "sorted","plain","s", False, False, None),
+        ("POST","fixed","key",  "s",  False, False, None),
+        ("POST","sorted","key","s",  False, False, None),
+        ("POST","fixed","amp",  "s",  False, False, None),
+        ("POST","fixed","prefix","s", False, False, None),
+        ("POST","fixed","plain","ms", False, False, None),
+        ("POST","fixed","plain","s",  True,  False, None),   # UPPERCASE MD5
+        ("POST","fixed","plain","s",  False, True,  None),   # include lang=en
+        # explicit param sequences some services use
+        ("POST","seq",  "plain","s",  False, False, ["cdk","fid","time"]),
+        ("POST","seq",  "plain","s",  False, False, ["time","fid","cdk"]),
+        ("GET", "seq",  "plain","s",  False, False, ["cdk","fid","time"]),
     ]
 
     with sync_playwright() as p:
@@ -301,17 +327,19 @@ try:
             for fid in sorted(roster.keys()):
                 status = "UNKNOWN"
 
-                for (method, order, concat, ts_mode, upper, lang) in VARIANTS:
+                for (method, order, concat, ts_mode, upper, lang, order_seq) in BASE_VARIANTS:
                     ts_value = str(int(time.time()*1000)) if ts_mode=="ms" else str(int(time.time()))
+                    # translate 'seq' into fixed sequence
+                    seq = order_seq if order == "seq" else None
                     sign = build_sign(fid, code, ts_value, WOS_SECRET,
-                                      order=order, concat=concat, uppercase=upper, include_lang=lang)
+                                      order=order, concat=concat, uppercase=upper,
+                                      include_lang=lang, order_seq=seq)
                     payload = {"fid": fid, "cdk": code, "time": ts_value, "sign": sign}
                     if lang: payload["lang"] = "en"
 
-                    # backoff loop for 429/403
-                    backoffs = [0, 2, 4, 8, 16]
-                    for tback in backoffs:
-                        if tback: time.sleep(tback)
+                    # backoff for 429/403
+                    for delay in (0, 2, 4, 8, 16):
+                        if delay: time.sleep(delay)
                         res = fetch_from_page(page, GIFTCODE_URL, method, payload)
                         http = int(res.get("status") or 0)
                         bodytxt = res.get("text") or ""
@@ -321,15 +349,15 @@ try:
                             msg = (bodytxt or "")[:120].upper()
 
                         if DEBUG:
-                            print(f"[DBG] {fid} {code} {method}/{order}/{concat}/{ts_mode} "
-                                  f"HTTP={http} :: {msg or _short(bodytxt)}")
+                            print(f"[DBG] {fid} {code} {method}/{order}/{concat}/{ts_mode}"
+                                  f"{'/UPPER' if upper else ''}{'/LANG' if lang else ''}"
+                                  f"{'/SEQ' if seq else ''} HTTP={http} :: {msg or _short(bodytxt)}")
 
                         if http in (429, 403):
-                            # try next backoff
-                            continue
+                            continue  # keep backing off
 
                         if http == 405:
-                            # try the other method immediately
+                            # flip method and retry once immediately
                             method = "GET" if method == "POST" else "POST"
                             continue
 
@@ -344,11 +372,11 @@ try:
                         elif "CDK NOT FOUND" in msg:
                             status = "INVALID"; break
                         elif "PARAMS" in msg or "SIGN" in msg:
-                            status = "PARAMS_ERROR" if "PARAMS" in msg else "SIGN_ERROR"
+                            status = "SIGN_ERROR" if "SIGN" in msg else "PARAMS_ERROR"
                             # try next variant
                         else:
                             status = msg or f"HTTP_{http}"
-                        break  # end backoff loop
+                        break  # exit backoff loop
 
                     if status in ("SUCCESS","ALREADY","SAME_TYPE"):
                         break  # stop trying variants for this fid/code
