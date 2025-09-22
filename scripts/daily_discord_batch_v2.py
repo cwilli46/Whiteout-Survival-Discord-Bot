@@ -1,3 +1,5 @@
+# scripts/daily_discord_batch_v2.py
+
 import os, sys, json, re, time, hashlib, requests, traceback
 from urllib.parse import urlencode
 from playwright.sync_api import sync_playwright
@@ -8,13 +10,13 @@ CODES_CH   = os.environ.get("DISCORD_CODES_CHANNEL_ID", "").strip()
 IDS_CH     = os.environ.get("DISCORD_IDS_CHANNEL_ID", "").strip()
 STATE_CH   = os.environ.get("DISCORD_STATE_CHANNEL_ID", "").strip()   # also used for summaries
 WOS_SECRET = os.environ.get("WOS_SECRET", "").strip()
-DEBUG      = os.environ.get("DEBUG", "0") == "1"
+DEBUG      = os.environ.get("DEBUG","0") == "1"
 
 if not all([BOT_TOKEN, CODES_CH, IDS_CH, STATE_CH, WOS_SECRET]):
     print("Missing one of: DISCORD_BOT_TOKEN, DISCORD_CODES_CHANNEL_ID, DISCORD_IDS_CHANNEL_ID, DISCORD_STATE_CHANNEL_ID, WOS_SECRET")
-    sys.exit(0)  # soft exit to keep workflow green during iteration
+    sys.exit(0)  # keep green while iterating
 
-def _short(s: str, n: int = 200) -> str:
+def _short(s: str, n: int = 160) -> str:
     s = s or ""
     return (s[:n] + "…") if len(s) > n else s
 
@@ -27,7 +29,7 @@ def post_message(channel_id, content):
                       headers={**D_HDR, "Content-Type":"application/json"},
                       json={"content": content[:1900]}, timeout=25)
     if not r.ok:
-        print(f"[ERR] Discord POST ch={channel_id} {r.status_code} {_short(r.text)}")
+        print(f"[ERR] Discord POST {r.status_code} {_short(r.text)}")
     return r.status_code
 
 def get_messages_after(channel_id, after_id=None, limit=100):
@@ -35,12 +37,12 @@ def get_messages_after(channel_id, after_id=None, limit=100):
     if after_id: params["after"] = str(after_id)
     r = requests.get(f"{D_API}/channels/{channel_id}/messages", headers=D_HDR, params=params, timeout=25)
     if not r.ok:
-        print(f"[ERR] Discord GET ch={channel_id} {r.status_code} {_short(r.text)}")
+        print(f"[ERR] Discord GET {r.status_code} {_short(r.text)}")
         return []
     try:
         return r.json()
     except Exception:
-        print(f"[ERR] Discord GET JSON parse failed ch={channel_id}")
+        print(f"[ERR] Discord GET JSON parse failed")
         return []
 
 def post_message_with_file(channel_id, content, filename, bytes_data):
@@ -50,7 +52,7 @@ def post_message_with_file(channel_id, content, filename, bytes_data):
                       headers=D_HDR, data={"payload_json": json.dumps(payload)},
                       files=files, timeout=40)
     if not r.ok:
-        print(f"[ERR] Discord POST file ch={channel_id} {r.status_code} {_short(r.text)}")
+        print(f"[ERR] Discord POST file {r.status_code} {_short(r.text)}")
     return r.json() if r.ok else {}
 
 def delete_message(channel_id, message_id):
@@ -151,83 +153,45 @@ def build_sign(fid: str, cdk: str, ts_value: str, secret: str,
     d = hashlib.md5(s.encode("utf-8")).hexdigest()
     return d.upper() if uppercase else d
 
-# Browser-like headers; API host needs X-Requested-With on some WAFs
-COMMON_HDRS = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-    "X-Requested-With": "XMLHttpRequest",
-}
-
-def post_form(url: str, form: dict, cookie: str | None, as_json=False):
-    headers = {**COMMON_HDRS,
-               "Origin": WEB_ORIGIN,
-               "Referer": WEB_REFERER}
-    headers["Content-Type"] = "application/json" if as_json else "application/x-www-form-urlencoded"
-    if cookie: headers["Cookie"] = cookie
-    r = requests.post(url,
-                      headers=headers,
-                      data=None if as_json else urlencode(form),
-                      json=form if as_json else None,
-                      timeout=25)
-    return r.status_code, r.text
-
-def get_form(url: str, params: dict, cookie: str | None):
-    headers = {**COMMON_HDRS,
-               "Origin": WEB_ORIGIN,
-               "Referer": WEB_REFERER}
-    if cookie: headers["Cookie"] = cookie
-    r = requests.get(url, headers=headers, params=params, timeout=25)
-    return r.status_code, r.text
-
-def get_cookies_for_hosts():
-    """Return two cookie headers: (cookie_web, cookie_api)."""
-    print("Acquiring cookies via headless Chromium…")
-    cookie_web = ""
-    cookie_api = ""
+# ========== Playwright helpers ==========
+def new_browser_context(p):
+    ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+    ctx = p.chromium.launch(headless=True).new_context(user_agent=ua)
+    # tiny stealth: hide webdriver flag
+    ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+    page = ctx.new_page()
+    # Hit the web site first (sets base cookies), then the API URL (so the API host issues clearance)
+    page.goto(WEB_REFERER, wait_until="networkidle", timeout=45000)
+    page.wait_for_timeout(2500)
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context()
-            page = ctx.new_page()
-            # Web host (sets general site cookies)
-            page.goto(WEB_REFERER, wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(2500)
-            # API host (get per-host clearance)
-            # A harmless GET so Cloudflare can issue a token for the API hostname
-            page.goto(GIFTCODE_URL, wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(2000)
-            cookies = ctx.cookies()
-            browser.close()
-        web_pairs, api_pairs = [], []
-        for c in cookies:
-            dom = (c.get("domain") or "").lstrip(".")
-            pair = f"{c['name']}={c['value']}"
-            if dom.endswith("wos-giftcode.centurygame.com"):
-                web_pairs.append(pair)
-            if dom.endswith("wos-giftcode-api.centurygame.com"):
-                api_pairs.append(pair)
-        cookie_web = "; ".join(web_pairs)
-        cookie_api = "; ".join(api_pairs)
-    except Exception as e:
-        print(f"[WARN] Playwright failed to fetch cookies: {e}")
-    return cookie_web, cookie_api
+        page.goto(GIFTCODE_URL, wait_until="networkidle", timeout=45000)
+        page.wait_for_timeout(1200)
+    except Exception:
+        pass
+    return ctx, page
 
-def redeem_once(cookie_api: str, fid: str, code: str, variant: dict):
-    ts_value = str(int(time.time() * 1000)) if variant.get("ts") == "ms" else str(int(time.time()))
-    sign = build_sign(fid, code, ts_value, WOS_SECRET,
-                      order=variant.get("order","fixed"),
-                      concat=variant.get("concat","plain"),
-                      uppercase=variant.get("uppercase", False),
-                      include_lang=variant.get("lang", False))
-    payload = {"fid": fid, "cdk": code, "time": ts_value, "sign": sign}
-    if variant.get("lang"): payload["lang"] = "en"
-    method = variant.get("method","POST")
-    body   = variant.get("body","form")
-    if method == "POST":
-        return post_form(GIFTCODE_URL, payload, cookie_api or None, as_json=(body=="json"))
-    else:
-        return get_form(GIFTCODE_URL, payload, cookie_api or None)
+def fetch_from_page(page, url, method, payload):
+    """Runs window.fetch in the page so the page’s cookies/headers are used."""
+    script = """
+      async ({url, method, payload}) => {
+        const enc = new URLSearchParams(payload).toString();
+        const init = {
+          method,
+          credentials: 'include',
+          headers: {'X-Requested-With':'XMLHttpRequest'}
+        };
+        if (method === 'POST') {
+          init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+          init.body = enc;
+        } else {
+          url = url + (url.includes('?') ? '&' : '?') + enc;
+        }
+        const res = await fetch(url, init);
+        const text = await res.text();
+        return {status: res.status, text};
+      }
+    """
+    return page.evaluate(script, {"url": url, "method": method, "payload": payload})
 
 # ========== MAIN ==========
 had_unhandled_error = False
@@ -269,22 +233,29 @@ try:
             roster[fid] = {"nickname": None, "stove": None, "updated_at": None}
             added.append(fid)
 
-    # ---- furnace scan ----
-    cookie_web, cookie_api = get_cookies_for_hosts()
-    print("Cookie(web):", "present" if cookie_web else "none")
-    print("Cookie(api):", "present" if cookie_api else "none")
+    # ---- player scan (HTTP via requests is fine here) ----
+    def post_form(url: str, form: dict):
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": WEB_ORIGIN,
+            "Referer": WEB_REFERER,
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        r = requests.post(url, headers=headers, data=urlencode(form), timeout=25)
+        return r.status_code, r.text
 
     ok_players = 0
     furnace_ups = []
     for fid, rec in roster.items():
         ts = str(int(time.time()))
         sign_p = sign_sorted({"fid": fid, "time": ts}, WOS_SECRET)
-        hp, bp = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p}, cookie=None)
+        hp, bp = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p})
         try:
             js = json.loads(bp)
         except Exception:
             js = {}
-
         if hp == 200 and js.get("msg") == "success":
             ok_players += 1
             data = js.get("data", {})
@@ -297,25 +268,6 @@ try:
                     furnace_ups.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
             except Exception:
                 pass
-        else:
-            # try once with API cookie if the plain request failed
-            hp2, bp2 = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p}, cookie_api or None)
-            try:
-                js2 = json.loads(bp2)
-            except Exception:
-                js2 = {}
-            if hp2 == 200 and js2.get("msg") == "success":
-                ok_players += 1
-                data = js2.get("data", {})
-                nick  = data.get("nickname")
-                stove = data.get("stove_lv")
-                prev  = rec.get("stove")
-                rec.update({"nickname": nick, "stove": stove, "updated_at": int(time.time())})
-                try:
-                    if prev is not None and stove is not None and int(stove) > int(prev):
-                        furnace_ups.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
-                except Exception:
-                    pass
         time.sleep(0.08)
 
     # ---- snapshot if no ups ----
@@ -326,106 +278,92 @@ try:
                 furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {rec.get('nickname') or ''}")
         furnace_snapshot.sort()
 
-    # ---- redeem for all roster fids ----
+    # ---- redeem inside a browser context to satisfy WAF ----
+    PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "6.0"))  # slow by default
     ok_redeems = fail_redeems = 0
     redeem_lines = []
 
-    PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "6.0"))  # ← slow default to dodge 429
-
-    def redeem_with_backoff(fid, code, variant):
-        http, bodytxt = None, ""
-        backoffs = [2, 4, 8, 16]  # exponential on hard limits
-        for i in range(len(backoffs) + 1):
-            http, bodytxt = redeem_once(cookie_api, fid, code, variant)
-            if http in (429, 403):  # WAF / rate limit
-                if i < len(backoffs):
-                    time.sleep(backoffs[i])
-                    continue
-            break
-        return http, bodytxt
-
-    DEFAULT_ATTEMPTS = [
-        # method, order, concat, ts, uppercase, lang, body, use_cookie
-        ("POST","fixed","plain","s", False, False,"form", True),
-        ("POST","sorted","plain","s", False, False,"form", True),
-        ("POST","fixed","amp",  "s", False, False,"form", True),
-        ("POST","fixed","key",  "s", False, False,"form", True),
-        ("POST","fixed","prefix","s", False, False,"form", True),
-        ("POST","fixed","plain","ms",False, False,"form", True),
-        ("POST","fixed","plain","s", True,  False,"form", True),
-        ("POST","fixed","plain","s", False, True, "form", True),
-        ("POST","fixed","plain","s", False, False,"json", True),
-        ("GET","fixed","plain","s", False, False,"form", True),
-        ("GET","sorted","plain","s", False, False,"form", True),
-        ("GET","fixed","amp",  "s", False, False,"form", True),
-        ("GET","fixed","key",  "s", False, False,"form", True),
-        ("GET","fixed","prefix","s", False, False,"form", True),
-        ("GET","fixed","plain","ms",False, False,"form", True),
+    # signer variants (kept small; browser context usually removes need for many)
+    VARIANTS = [
+        # method, order, concat, ts, uppercase, lang
+        ("POST","fixed","plain","s", False, False),
+        ("GET", "fixed","plain","s", False, False),
+        ("POST","sorted","plain","s", False, False),
+        ("GET", "sorted","plain","s", False, False),
+        ("POST","fixed","plain","ms",False, False),
     ]
 
-    def attempts_for_hint(h):
-        if h == "GET":
-            return [a for a in DEFAULT_ATTEMPTS if a[0]=="GET"] + [a for a in DEFAULT_ATTEMPTS if a[0]=="POST"]
-        if h == "POST":
-            return [a for a in DEFAULT_ATTEMPTS if a[0]=="POST"] + [a for a in DEFAULT_ATTEMPTS if a[0]=="GET"]
-        return DEFAULT_ATTEMPTS
+    with sync_playwright() as p:
+        ctx, page = new_browser_context(p)
 
-    method_hint = None
-
-    for code in sorted(codes):
-        safe_code = code[:3]+"…" if len(code)>3 else code
-        for fid in sorted(roster.keys()):
-            while True:
-                ATTEMPTS = attempts_for_hint(method_hint)
+        for code in sorted(codes):
+            safe_code = code[:3]+"…" if len(code)>3 else code
+            for fid in sorted(roster.keys()):
                 status = "UNKNOWN"
-                flipped = False
 
-                for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in ATTEMPTS:
-                    variant = {"method":method,"order":order,"concat":concat,"ts":ts_mode,
-                               "uppercase":upper,"lang":lang,"body":body,"use_cookie":use_cookie}
-                    http, bodytxt = redeem_with_backoff(fid, code, variant)
-                    try:
-                        rg = json.loads(bodytxt); msg = (rg.get("msg") or "").upper()
-                    except Exception:
-                        msg = (bodytxt or "")[:120].upper()
+                for (method, order, concat, ts_mode, upper, lang) in VARIANTS:
+                    ts_value = str(int(time.time()*1000)) if ts_mode=="ms" else str(int(time.time()))
+                    sign = build_sign(fid, code, ts_value, WOS_SECRET,
+                                      order=order, concat=concat, uppercase=upper, include_lang=lang)
+                    payload = {"fid": fid, "cdk": code, "time": ts_value, "sign": sign}
+                    if lang: payload["lang"] = "en"
 
-                    if DEBUG:
-                        print(f"[DBG] {fid} {code} {method}/{order}/{concat}/{ts_mode} cookie=api "
-                              f"HTTP={http} :: {msg or _short(bodytxt)}")
+                    # backoff loop for 429/403
+                    backoffs = [0, 2, 4, 8, 16]
+                    for tback in backoffs:
+                        if tback: time.sleep(tback)
+                        res = fetch_from_page(page, GIFTCODE_URL, method, payload)
+                        http = int(res.get("status") or 0)
+                        bodytxt = res.get("text") or ""
+                        try:
+                            js = json.loads(bodytxt); msg = (js.get("msg") or "").upper()
+                        except Exception:
+                            msg = (bodytxt or "")[:120].upper()
 
-                    if http == 405 and method_hint is None:
-                        method_hint = "GET" if method == "POST" else "POST"
-                        flipped = True
-                        break
+                        if DEBUG:
+                            print(f"[DBG] {fid} {code} {method}/{order}/{concat}/{ts_mode} "
+                                  f"HTTP={http} :: {msg or _short(bodytxt)}")
 
-                    if "SUCCESS" in msg:
-                        status = "SUCCESS"; break
-                    elif "RECEIVED" in msg:
-                        status = "ALREADY"; break
-                    elif "SAME TYPE EXCHANGE" in msg:
-                        status = "SAME_TYPE"; break
-                    elif "TIME ERROR" in msg:
-                        status = "EXPIRED"; break
-                    elif "CDK NOT FOUND" in msg:
-                        status = "INVALID"; break
-                    elif "PARAMS" in msg or "SIGN" in msg:
-                        status = "PARAMS_ERROR" if "PARAMS" in msg else "SIGN_ERROR"
-                        continue
-                    else:
-                        status = msg or f"HTTP_{http}"
-                        if status not in ("UNKNOWN","PARSE_ERROR"):
-                            break
+                        if http in (429, 403):
+                            # try next backoff
+                            continue
 
-                if flipped:
-                    continue  # restart with new order
+                        if http == 405:
+                            # try the other method immediately
+                            method = "GET" if method == "POST" else "POST"
+                            continue
+
+                        if "SUCCESS" in msg:
+                            status = "SUCCESS"; break
+                        elif "RECEIVED" in msg:
+                            status = "ALREADY"; break
+                        elif "SAME TYPE EXCHANGE" in msg:
+                            status = "SAME_TYPE"; break
+                        elif "TIME ERROR" in msg:
+                            status = "EXPIRED"; break
+                        elif "CDK NOT FOUND" in msg:
+                            status = "INVALID"; break
+                        elif "PARAMS" in msg or "SIGN" in msg:
+                            status = "PARAMS_ERROR" if "PARAMS" in msg else "SIGN_ERROR"
+                            # try next variant
+                        else:
+                            status = msg or f"HTTP_{http}"
+                        break  # end backoff loop
+
+                    if status in ("SUCCESS","ALREADY","SAME_TYPE"):
+                        break  # stop trying variants for this fid/code
 
                 ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
                 ok_redeems += int(ok); fail_redeems += int(not ok)
                 redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
-                time.sleep(PACING)  # global pacing between calls
-                break
+                time.sleep(PACING)
 
-    # ---- save new checkpoint to Discord ----
+        try:
+            ctx.browser.close()
+        except Exception:
+            pass
+
+    # ---- save checkpoint/state back to Discord ----
     new_state = {
         "last_id_codes": str(last_codes),
         "last_id_ids":   str(last_ids),
