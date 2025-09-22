@@ -149,7 +149,17 @@ class CaptchaSession:
         self.ctx = self.browser.new_context()
         self.page = self.ctx.new_page()
         self.page.goto(REFERER, wait_until="domcontentloaded", timeout=45000)
-        self.page.wait_for_timeout(1200)
+
+        # Wait for the captcha image and refresh icon that your page uses
+        try:
+            self.page.wait_for_selector("img.verify_pic", timeout=8000)
+        except Exception:
+            pass
+        try:
+            self.page.wait_for_selector("img.reload_btn", timeout=8000)
+        except Exception:
+            pass
+        self.page.wait_for_timeout(600)
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -167,43 +177,61 @@ class CaptchaSession:
                 pairs.append(f"{c['name']}={c['value']}")
         return "; ".join(pairs)
 
-    def screenshot_captcha(self) -> bytes | None:
-        # Try several selectors; fall back to full-page crop if needed
-        sels = [
-            'img[src*="captcha"]',
-            'img[alt*="captcha" i]',
-            '[class*="captcha"] img',
-            'canvas',
-        ]
-        for sel in sels:
-            try:
-                el = self.page.query_selector(sel)
-                if el:
-                    return el.screenshot(type="png")
-            except: pass
+    def captcha_bytes(self) -> bytes | None:
+        """
+        Prefer perfect base64 from the DOM: <img class="verify_pic" src="data:image/jpeg;base64,...">
+        Fallback to element screenshot if needed.
+        """
+        try:
+            el = self.page.query_selector("img.verify_pic") or self.page.query_selector("div.verify_pic_con img")
+            if el:
+                src = el.get_attribute("src") or ""
+                if src.startswith("data:image"):
+                    b64 = src.split(",", 1)[1]
+                    return base64.b64decode(b64)
+                # fallback: pixel screenshot of the element
+                return el.screenshot(type="png")
+        except Exception:
+            pass
+        # last resort: full-page screenshot (rarely needed)
         try:
             return self.page.screenshot(type="png")
-        except:
+        except Exception:
             return None
 
     def refresh_captcha(self):
-        # Try clicking a refresh icon; else reload
-        sels = [
-            '[class*="captcha"] button',
-            'button[aria-label*="refresh" i]',
-            'img[src*="captcha"]',
-        ]
-        for sel in sels:
-            try:
-                el = self.page.query_selector(sel)
-                if el:
-                    el.click()
-                    self.page.wait_for_timeout(700)
-                    return
-            except: pass
-        # fallback: reload keeps cookies
-        self.page.reload(wait_until="domcontentloaded")
-        self.page.wait_for_timeout(800)
+        """
+        Click the reload icon (img.reload_btn). If we can, wait until the <img.verify_pic> src changes.
+        Fallback to page reload if click not available.
+        """
+        try:
+            pic = self.page.query_selector("img.verify_pic")
+            old_src = pic.get_attribute("src") if pic else None
+
+            btn = self.page.query_selector("img.reload_btn") or self.page.query_selector(".reload_btn")
+            if btn:
+                btn.click()
+                # wait briefly and ensure the captcha actually changed
+                if old_src:
+                    self.page.wait_for_function(
+                        "(sel, oldSrc) => { const el=document.querySelector(sel); return el && el.src && el.src !== oldSrc; }",
+                        arg=("img.verify_pic", old_src),
+                        timeout=3000
+                    )
+                else:
+                    self.page.wait_for_timeout(800)
+                return
+        except Exception:
+            pass
+
+        # Fallback: reload keeps cookies and usually rotates captcha
+        try:
+            self.page.reload(wait_until="domcontentloaded")
+            self.page.wait_for_selector("img.verify_pic", timeout=6000)
+        except Exception:
+            # nothing else to do
+            self.page.wait_for_timeout(800)
+
 
 # -------- OCR helpers (free) --------
 def tesseract_read(png: bytes) -> str:
@@ -263,7 +291,7 @@ def solve_captcha_ensemble(png: bytes) -> str:
 # Try current captcha; on fail, refresh and retry up to N times
 def get_working_captcha(sess: CaptchaSession, max_refresh=4) -> str:
     for i in range(max_refresh+1):
-        png = sess.screenshot_captcha()
+        png = sess.captcha_bytes()
         code = solve_captcha_ensemble(png)
         if 4 <= len(code) <= 8:
             return code
