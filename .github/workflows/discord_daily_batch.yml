@@ -1,58 +1,44 @@
-name: WOS Daily Batch (free OCR)
+name: WOS Discord Daily
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # run once per day at 16:30 UTC; adjust as you like
-    - cron: "30 16 * * *"
+    - cron: "15 11 * * *"   # adjust time
+  workflow_dispatch:
 
 jobs:
   run:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 25
-    permissions:
-      contents: read
-
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DISCORD_CODES_CHANNEL_ID: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
+      DISCORD_IDS_CHANNEL_ID: ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
+      DISCORD_STATE_CHANNEL_ID: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
+      WOS_SECRET: ${{ secrets.WOS_SECRET }}
+      REDEEM_PACING_SECONDS: "1.8"
+      DEBUG: "1"                        # turn off later if too chatty
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: System deps (Tesseract + EasyOCR libs)
+      - name: Install system deps (Tesseract)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            tesseract-ocr \
-            libtesseract-dev \
-            libgl1 \
-            libglib2.0-0 \
-            fonts-dejavu-core
+          sudo apt-get install -y tesseract-ocr libtesseract-dev
 
-      - name: Python deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install requests pillow pytesseract easyocr playwright
+
+      - name: Install Playwright Chromium
+        run: |
           python -m playwright install --with-deps chromium
 
-      - name: Preflight (redacted)
-        run: |
-          echo "Codes CH: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}"
-          echo "IDs   CH: ${{ secrets.DISCORD_IDS_CHANNEL_ID }}"
-          echo "State CH: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}"
-          echo "DEBUG   : ${{ vars.DEBUG || '0' }}"
-
       - name: Run daily job
-        env:
-          DISCORD_BOT_TOKEN:         ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_CODES_CHANNEL_ID:  ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
-          DISCORD_IDS_CHANNEL_ID:    ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
-          DISCORD_STATE_CHANNEL_ID:  ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
-          WOS_SECRET:                ${{ secrets.WOS_SECRET }}
-          REDEEM_PACING_SECONDS:     ${{ vars.REDEEM_PACING_SECONDS || '1.8' }}
-          DEBUG:                     ${{ vars.DEBUG || '0' }}
         run: |
-          python scripts/daily_discord_batch_v2.py
+          python scripts/daily_discord_batch.py
