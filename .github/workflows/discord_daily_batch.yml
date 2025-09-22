@@ -1,75 +1,58 @@
-name: WOS Daily Discord Batch (OCR)
+name: WOS Daily Batch (free OCR)
 
 on:
   workflow_dispatch: {}
   schedule:
-    # 08:00 UTC daily — change if you like
-    - cron: "0 8 * * *"
-
-concurrency:
-  group: wos-daily-discord
-  cancel-in-progress: false
+    # run once per day at 16:30 UTC; adjust as you like
+    - cron: "30 16 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 25
     permissions:
       contents: read
 
     steps:
-      - name: Checkout
+      - name: Check out
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
-      - name: Install system deps (Tesseract OCR)
+      - name: System deps (Tesseract + EasyOCR libs)
         run: |
           sudo apt-get update
-          sudo apt-get install -y tesseract-ocr libtesseract-dev
-          fc-cache -f -v || true
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr \
+            libtesseract-dev \
+            libgl1 \
+            libglib2.0-0 \
+            fonts-dejavu-core
 
-      - name: Install Python deps (requests + OCR + Playwright)
+      - name: Python deps
         run: |
           python -m pip install --upgrade pip
           pip install requests pillow pytesseract easyocr playwright
           python -m playwright install --with-deps chromium
 
-      - name: Preflight env (redacted)
+      - name: Preflight (redacted)
         run: |
-          echo "Python: $(python --version)"
-          echo "Bot token set:         ${{ secrets.DISCORD_BOT_TOKEN != '' }}"
-          echo "Codes channel set:     ${{ secrets.DISCORD_CODES_CHANNEL_ID != '' }}"
-          echo "IDs channel set:       ${{ secrets.DISCORD_IDS_CHANNEL_ID != '' }}"
-          echo "State channel set:     ${{ secrets.DISCORD_STATE_CHANNEL_ID != '' }}"
-          echo "WOS secret set:        ${{ secrets.WOS_SECRET != '' }}"
-
-      - name: Locate script
-        id: findscript
-        shell: bash
-        run: |
-          set -e
-          SCRIPT=$(git ls-files 'scripts/daily_discord_batch*.py' | head -n1 || true)
-          if [[ -z "$SCRIPT" ]]; then
-            echo "No scripts/daily_discord_batch*.py found"; exit 1
-          fi
-          echo "SCRIPT_PATH=$SCRIPT" >> $GITHUB_ENV
-          echo "Found script: $SCRIPT"
+          echo "Codes CH: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}"
+          echo "IDs   CH: ${{ secrets.DISCORD_IDS_CHANNEL_ID }}"
+          echo "State CH: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}"
+          echo "DEBUG   : ${{ vars.DEBUG || '0' }}"
 
       - name: Run daily job
         env:
-          DISCORD_BOT_TOKEN:        ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_CODES_CHANNEL_ID: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
-          DISCORD_IDS_CHANNEL_ID:   ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
-          DISCORD_STATE_CHANNEL_ID: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
-          WOS_SECRET:               ${{ secrets.WOS_SECRET }}
-          # Optional repo vars to tweak behavior without editing code
-          REDEEM_PACING_SECONDS:    ${{ vars.REDEEM_PACING_SECONDS || '2.3' }}
-          DEBUG:                    ${{ vars.DEBUG || '0' }}
+          DISCORD_BOT_TOKEN:         ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CODES_CHANNEL_ID:  ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
+          DISCORD_IDS_CHANNEL_ID:    ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
+          DISCORD_STATE_CHANNEL_ID:  ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
+          WOS_SECRET:                ${{ secrets.WOS_SECRET }}
+          REDEEM_PACING_SECONDS:     ${{ vars.REDEEM_PACING_SECONDS || '1.8' }}
+          DEBUG:                     ${{ vars.DEBUG || '0' }}
         run: |
-          set -e
-          python "$SCRIPT_PATH"
+          python scripts/daily_discord_batch_v2.py
