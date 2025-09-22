@@ -19,12 +19,12 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       # Debug/test tuning (feel free to change or remove later)
       DEBUG: "0"
-      SAVE_CAPTCHAS: "0"
+      SAVE_CAPTCHAS: "1"
       REDEEM_PACING_SECONDS: "1.8"
       REDEEM_MAX_ATTEMPTS: "3"
       CAPTCHA_MAX_REFRESH: "4"
-      MAX_FIDS: "0"      # 0 = no cap; set small numbers while testing
-      MAX_CODES: "0"
+      MAX_FIDS: "3"      # 0 = no cap; set small numbers while testing
+      MAX_CODES: "1"
 
       # Required secrets
       DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
