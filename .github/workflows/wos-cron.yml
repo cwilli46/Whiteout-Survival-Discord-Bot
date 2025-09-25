@@ -39,4 +39,20 @@ jobs:
           DISCORD_SUMMARY_CHANNEL_ID: ${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}
           ALLIANCE_NAME:              ${{ secrets.ALLIANCE_NAME }}
           WOS_SECRET:                 ${{ secrets.WOS_SECRET }}
-          REDEEM_PACING_SE
+          REDEEM_PACING_SECONDS:      ${{ secrets.REDEEM_PACING_SECONDS }}
+        run: python scripts/daily.py
+
+      - name: Commit state
+        run: |
+          git config user.name  "wos-bot"
+          git config user.email "wos-bot@users.noreply.github.com"
+          git add state/*.json logs/*.txt 2>/dev/null || true
+          git commit -m "chore: daily state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
+          git push || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wos-logs
+          path: logs
