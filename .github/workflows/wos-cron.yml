@@ -2,7 +2,7 @@ name: WOS Daily
 
 on:
   schedule:
-    - cron: "20 9 * * *"   # 09:20 UTC daily (~02:20 Phoenix)
+    - cron: "20 9 * * *"   # daily 09:20 UTC
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,6 @@ permissions:
 jobs:
   daily:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,29 +25,28 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests discord-webhook pytz
+          pip install requests pytz
 
       - name: Prepare folders
-        run: |
-          mkdir -p state logs
+        run: mkdir -p state logs
 
-      - name: Run daily tasks
+      - name: Run daily
         env:
-          DISCORD_WEBHOOK_FURNACE: ${{ secrets.DISCORD_WEBHOOK_FURNACE }}
-          DISCORD_WEBHOOK_CHANGES: ${{ secrets.DISCORD_WEBHOOK_CHANGES }}
-          DISCORD_WEBHOOK_CODES:   ${{ secrets.DISCORD_WEBHOOK_CODES }}
-          ALLIANCE_NAME:           ${{ secrets.ALLIANCE_NAME }}     # e.g. AXE
-          WOS_MEMBER_FIDS:         ${{ secrets.WOS_MEMBER_FIDS }}   # comma-separated FIDs
-          TEST_FID:                ${{ secrets.TEST_FID }}          # optional single FID for code “preflight”
-        run: |
-          python .github/scripts/daily.py
+          DISCORD_BOT_TOKEN:         ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_IDS_CHANNEL_ID:    ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
+          DISCORD_CODES_CHANNEL_ID:  ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
+          DISCORD_SUMMARY_CHANNEL_ID:${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}
+          ALLIANCE_NAME:             ${{ secrets.ALLIANCE_NAME }}   # e.g., AXE
+          WOS_SECRET:                ${{ secrets.WOS_SECRET }}      # from your secrets
+          REDEEM_PACING_SECONDS:     ${{ secrets.REDEEM_PACING_SECONDS }} # optional; defaults 0.3
+        run: python .github/scripts/daily.py
 
-      - name: Commit state (diff memory)
+      - name: Commit state
         run: |
           git config user.name  "wos-bot"
           git config user.email "wos-bot@users.noreply.github.com"
           git add state/*.json logs/*.txt 2>/dev/null || true
-          git commit -m "chore: daily state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes to commit"
+          git commit -m "chore: daily state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
           git push || true
 
       - name: Upload logs
