@@ -1,7 +1,8 @@
 import os, re, json, time, hashlib, requests, pathlib, datetime
 from typing import List, Dict, Tuple
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+# was: parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[1]  # from /scripts to repo root
 STATE = ROOT / "state" / "members.json"
 LOGS  = ROOT / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
