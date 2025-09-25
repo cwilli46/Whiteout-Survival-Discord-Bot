@@ -1,23 +1,31 @@
-import os, json, time, hashlib, requests, pathlib, datetime
-from urllib.parse import urlencode
+import os, re, json, time, hashlib, requests, pathlib, datetime
+from typing import List, Dict, Tuple
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 STATE = ROOT / "state" / "members.json"
 LOGS  = ROOT / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
 
-WOS_PLAYER_URL   = "https://wos-giftcode-api.centurygame.com/api/player"
-WOS_GIFTCODE_URL = "https://wos-giftcode-api.centurygame.com/api/gift_code"
-WOS_ORIGIN       = "https://wos-giftcode.centurygame.com"
-SECRET           = "tB87#kPtkxqOS2"  # matches the repo’s cogs
+# ---- Config from env
+ALLIANCE = os.getenv("ALLIANCE_NAME", "Alliance")
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+CHAN_FIDS = os.getenv("DISCORD_IDS_CHANNEL_ID", "")
+CHAN_CODES = os.getenv("DISCORD_CODES_CHANNEL_ID", "")
+CHAN_SUMMARY = os.getenv("DISCORD_SUMMARY_CHANNEL_ID", "")
+WOS_SECRET = os.getenv("WOS_SECRET", "tB87#kPtkxqOS2").strip()
+PACE = float(os.getenv("REDEEM_PACING_SECONDS", "0.3"))
 
+# ---- WOS endpoints
+WOS_PLAYER_URL   = "https://wos-giftcode-api.centurygame.com/api/player"
+WOS_ORIGIN       = "https://wos-giftcode.centurygame.com"
+
+# ---- Helpers
 def log(msg, fname="daily.log"):
     ts = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
     with open(LOGS / fname, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {msg}\n")
 
 def md5sign(data: dict) -> dict:
-    # API expects sign over keys sorted lexicographically, appended with SECRET
     parts = []
     for k in sorted(data.keys()):
         v = data[k]
@@ -25,10 +33,10 @@ def md5sign(data: dict) -> dict:
             v = json.dumps(v, separators=(",", ":"), ensure_ascii=False)
         parts.append(f"{k}={v}")
     encoded = "&".join(parts)
-    sign = hashlib.md5((encoded + SECRET).encode("utf-8")).hexdigest()
+    sign = hashlib.md5((encoded + WOS_SECRET).encode("utf-8")).hexdigest()
     return {"sign": sign, **data}
 
-def session():
+def wos_session():
     s = requests.Session()
     s.headers.update({
         "accept": "application/json, text/plain, */*",
@@ -37,44 +45,115 @@ def session():
         "referer": WOS_ORIGIN + "/",
         "user-agent": "Mozilla/5.0 GitHubActions WOSBot",
     })
-    s.timeout = 30
     return s
 
-def fetch_player(fid: str):
-    payload = {"fid": fid, "time": int(time.time())}
-    data = md5sign(payload)
-    r = session().post(WOS_PLAYER_URL, data=data)
-    j = r.json()
-    log(f"player {fid} -> {j}", "wos_api.log")
-    # Expect {"msg":"success","data":{"fid":...,"nickname":...,"furnace_lv":...}}
-    if j.get("msg") == "success" and "data" in j:
-        d = j["data"]
-        return {
-            "fid": str(d.get("fid", fid)),
-            "nickname": d.get("nickname", "").strip(),
-            "furnace_lv": int(d.get("furnace_lv", 0)),
-        }
-    return None
+def discord_session():
+    s = requests.Session()
+    s.headers.update({
+        "Authorization": f"Bot {BOT_TOKEN}",
+        "Content-Type": "application/json"
+    })
+    return s
 
-def load_snapshot():
+def discord_fetch_all_messages(channel_id: str, limit_total: int = 1000) -> List[dict]:
+    """Page through recent messages so you can store FIDs/Codes in pinned or recent posts."""
+    s = discord_session()
+    msgs, last_id = [], None
+    remaining = limit_total
+    while remaining > 0:
+        params = {"limit": min(100, remaining)}
+        if last_id:
+            params["before"] = last_id
+        r = s.get(f"https://discord.com/api/v10/channels/{channel_id}/messages", params=params, timeout=30)
+        if r.status_code != 200:
+            log(f"Discord GET messages {channel_id} -> {r.status_code} {r.text}", "discord.log")
+            break
+        batch = r.json()
+        if not batch:
+            break
+        msgs.extend(batch)
+        last_id = batch[-1]["id"]
+        remaining -= len(batch)
+    log(f"Fetched {len(msgs)} msgs from {channel_id}", "discord.log")
+    return msgs
+
+def discord_post(channel_id: str, content: str):
+    if not channel_id or not content:
+        return
+    s = discord_session()
+    # chunk to 2000-char Discord limit
+    chunks = []
+    while content:
+        chunks.append(content[:1900])
+        content = content[1900:]
+    for c in chunks:
+        r = s.post(f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                   json={"content": c}, timeout=30)
+        log(f"POST to {channel_id} -> {r.status_code}", "discord.log")
+        time.sleep(1)
+
+# ---- Parsers
+FID_RE = re.compile(r"\b\d{3,18}\b")  # FID = numeric id, fairly long
+CODE_RE = re.compile(r"\b[A-Z0-9]{4,20}\b", re.I)
+
+def parse_fids_from_messages(msgs: List[dict]) -> List[str]:
+    fids = set()
+    for m in msgs:
+        if m.get("author", {}).get("bot"):
+            # allow bot posts too—teams sometimes paste lists via bot
+            pass
+        text = (m.get("content") or "").strip()
+        # Skip obvious comments
+        if text.startswith("#"):
+            continue
+        for tok in FID_RE.findall(text):
+            fids.add(tok)
+    return sorted(fids, key=lambda x: int(x))
+
+def parse_codes_from_messages(msgs: List[dict]) -> List[str]:
+    codes = []
+    seen = set()
+    for m in msgs:
+        text = (m.get("content") or "").upper()
+        if text.startswith("#"):
+            continue
+        for tok in CODE_RE.findall(text):
+            if tok not in seen:
+                seen.add(tok)
+                codes.append(tok)
+    return codes
+
+# ---- State
+def load_snapshot() -> Dict[str, dict]:
     if STATE.exists():
         return json.loads(STATE.read_text(encoding="utf-8"))
     return {}
 
-def save_snapshot(snapshot: dict):
+def save_snapshot(snapshot: Dict[str, dict]):
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def webhook(url: str, content: str):
-    if not url:
-        log("No webhook URL provided; skipping post")
-        return
-    resp = requests.post(url, json={"content": content[:1990]})
-    log(f"webhook status {resp.status_code}")
+# ---- WOS
+def fetch_player(fid: str):
+    payload = {"fid": fid, "time": int(time.time())}
+    data = md5sign(payload)
+    r = wos_session().post(WOS_PLAYER_URL, data=data, timeout=30)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"status": r.status_code, "text": r.text[:200]}
+    log(f"player {fid} -> {j}", "wos_api.log")
+    if isinstance(j, dict) and j.get("msg") == "success" and "data" in j:
+        d = j["data"]
+        return {
+            "fid": str(d.get("fid", fid)),
+            "nickname": (d.get("nickname") or "").strip(),
+            "furnace_lv": int(d.get("furnace_lv", 0)),
+        }
+    return None
 
-def summarize_diffs(prev: dict, curr: dict, alliance: str):
-    name_changes = []
-    furnace_changes = []
+def summarize_diffs(prev: Dict[str, dict], curr: Dict[str, dict]) -> Tuple[str, str]:
+    name_changes, furnace_changes = [], []
     for fid, now in curr.items():
         before = prev.get(fid)
         if not before:
@@ -84,84 +163,83 @@ def summarize_diffs(prev: dict, curr: dict, alliance: str):
         if int(now["furnace_lv"]) != int(before.get("furnace_lv", 0)):
             furnace_changes.append((before.get("furnace_lv", 0), now["furnace_lv"], now["nickname"], fid))
 
-    name_msg = ""
     if name_changes:
-        lines = [f"📝 **Recent Nickname Changes — {alliance}**"]
-        for old, new, fid in name_changes[:40]:
+        lines = [f"📝 **Recent Nickname Changes — {ALLIANCE}**"]
+        for old, new, fid in name_changes[:50]:
             lines.append(f"- `{old}` → `{new}` (FID {fid})")
         name_msg = "\n".join(lines)
     else:
-        name_msg = f"📝 **Recent Nickname Changes — {alliance}**\n- None in this window."
+        name_msg = f"📝 **Recent Nickname Changes — {ALLIANCE}**\n- None in this window."
 
-    furnace_msg = ""
     if furnace_changes:
-        lines = [f"🔥 **Recent Furnace Changes — {alliance}**"]
-        for old, new, nick, fid in sorted(furnace_changes, key=lambda x: x[1])[:40]:
-            lines.append(f"- `{nick}` (FID {fid}): **{old} → {new}**")
+        lines = [f"🔥 **Recent Furnace Changes — {ALLIANCE}**"]
+        for old, new, nick, fid in sorted(furnace_changes, key=lambda x: (x[1], x[2]))[:50]:
+            label = nick if nick else f"FID {fid}"
+            lines.append(f"- `{label}`: **{old} → {new}** (FID {fid})")
         furnace_msg = "\n".join(lines)
     else:
-        furnace_msg = f"🔥 **Recent Furnace Changes — {alliance}**\n- None in this window."
+        furnace_msg = f"🔥 **Recent Furnace Changes — {ALLIANCE}**\n- None in this window."
 
     return name_msg, furnace_msg
 
-def code_link(code: str, fid: str) -> str:
-    # Broadcast a prefilled redemption URL to keep this fully manual & TOS-safe.
-    # (Do not auto-post the sign/time; the website will drive the flow.)
-    return f"https://wos-giftcode.centurygame.com/?fid={fid}&cdk={code}"
-
-def broadcast_codes(alliance: str, test_fid: str):
-    path = ROOT / "giftcodes.txt"
-    if not path.exists():
-        log("No giftcodes.txt found; skip code broadcast")
-        return None
-
-    codes = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        c = raw.strip().split()[0]
-        if c and c.isalnum():
-            codes.append(c)
-
+def codes_summary(codes: List[str]) -> str:
     if not codes:
-        return None
-
-    lines = [f"🎁 **Gift Codes for {alliance}**"]
-    sample = codes[:20]
-    for c in sample:
-        if test_fid:
-            lines.append(f"- `{c}` → {code_link(c, test_fid)}")
-        else:
-            lines.append(f"- `{c}` (open the redemption site and paste)")
-
-    if len(codes) > len(sample):
-        lines.append(f"...and {len(codes)-len(sample)} more.")
-
+        return ""
+    lines = [f"🎁 **Gift Codes (manual redeem)**"]
+    for c in codes[:50]:
+        lines.append(f"- `{c}`  → https://wos-giftcode.centurygame.com/")
+    if len(codes) > 50:
+        lines.append(f"...and {len(codes)-50} more.")
     return "\n".join(lines)
 
+# ---- Main
 def main():
-    alliance = os.getenv("ALLIANCE_NAME", "Alliance")
-    fids = [f.strip() for f in os.getenv("WOS_MEMBER_FIDS", "").split(",") if f.strip()]
-    if not fids:
-        log("WOS_MEMBER_FIDS empty; nothing to do")
+    if not BOT_TOKEN:
+        log("Missing DISCORD_BOT_TOKEN; abort")
+        return
+    if not CHAN_FIDS:
+        log("Missing DISCORD_IDS_CHANNEL_ID; abort")
+        return
+    if not CHAN_SUMMARY:
+        log("Missing DISCORD_SUMMARY_CHANNEL_ID; abort")
         return
 
+    # 1) Pull FIDs and Codes from Discord channels
+    fid_msgs = discord_fetch_all_messages(CHAN_FIDS, limit_total=400)
+    fids = parse_fids_from_messages(fid_msgs)
+    if not fids:
+        discord_post(CHAN_SUMMARY, "⚠️ No FIDs found in the IDs channel. Please paste numeric FIDs (one per line).")
+        log("No FIDs parsed; abort")
+        return
+
+    code_list = []
+    if CHAN_CODES:
+        code_msgs = discord_fetch_all_messages(CHAN_CODES, limit_total=400)
+        code_list = parse_codes_from_messages(code_msgs)
+
+    # 2) Fetch current player data
     prev = load_snapshot()
     curr = {}
-
     for fid in fids:
         data = fetch_player(fid)
         if data:
             curr[fid] = data
-        time.sleep(0.3)  # be nice
+        time.sleep(PACE)
 
-    name_msg, furnace_msg = summarize_diffs(prev, curr, alliance)
+    # 3) Diff and post summary
+    name_msg, furnace_msg = summarize_diffs(prev, curr)
+    summary = f"**Daily WOS Summary — {ALLIANCE}**\n" \
+              f"{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n" \
+              f"{name_msg}\n\n{furnace_msg}"
+
+    discord_post(CHAN_SUMMARY, summary)
+
+    # 4) Codes (broadcast as manual redeem list — no auto-redeem to avoid CAPTCHA/TOS issues)
+    if code_list:
+        discord_post(CHAN_SUMMARY, codes_summary(code_list))
+
+    # 5) Save snapshot for tomorrow
     save_snapshot(curr)
-
-    webhook(os.getenv("DISCORD_WEBHOOK_CHANGES", ""), name_msg)
-    webhook(os.getenv("DISCORD_WEBHOOK_FURNACE", ""), furnace_msg)
-
-    codes_msg = broadcast_codes(alliance, os.getenv("TEST_FID", "").strip())
-    if codes_msg:
-        webhook(os.getenv("DISCORD_WEBHOOK_CODES", ""), codes_msg)
 
 if __name__ == "__main__":
     main()
