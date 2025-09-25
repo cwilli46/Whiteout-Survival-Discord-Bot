@@ -3,19 +3,21 @@ import os, sys, json, re, time, hashlib, requests, traceback
 from urllib.parse import urlencode
 from playwright.sync_api import sync_playwright
 
-# ========== CONFIG ==========
-BOT_TOKEN  = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-CODES_CH   = os.environ.get("DISCORD_CODES_CHANNEL_ID", "").strip()
-IDS_CH     = os.environ.get("DISCORD_IDS_CHANNEL_ID", "").strip()
-STATE_CH   = os.environ.get("DISCORD_STATE_CHANNEL_ID", "").strip()   # also used for summaries
-WOS_SECRET = os.environ.get("WOS_SECRET", "").strip()
-DEBUG      = os.environ.get("DEBUG","0") == "1"
+# ===================== CONFIG =====================
+BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+CODES_CH    = os.environ.get("DISCORD_CODES_CHANNEL_ID", "").strip()
+IDS_CH      = os.environ.get("DISCORD_IDS_CHANNEL_ID", "").strip()
+SUMMARY_CH  = os.environ.get("DISCORD_SUMMARY_CHANNEL_ID", "").strip()  # single channel for state + summary
+WOS_SECRET  = os.environ.get("WOS_SECRET", "").strip()
+DEBUG       = os.environ.get("DEBUG","0") == "1"
+PACING      = float(os.environ.get("REDEEM_PACING_SECONDS", "1.25"))
+MANUAL_CAPTCHA = os.environ.get("CAPTCHA_CODE","").strip()  # optional, human-provided
 
-if not all([BOT_TOKEN, CODES_CH, IDS_CH, STATE_CH, WOS_SECRET]):
-    print("Missing one of: DISCORD_BOT_TOKEN, DISCORD_CODES_CHANNEL_ID, DISCORD_IDS_CHANNEL_ID, DISCORD_STATE_CHANNEL_ID, WOS_SECRET")
-    sys.exit(0)  # soft exit so workflow stays green for easier iteration
+if not all([BOT_TOKEN, CODES_CH, IDS_CH, SUMMARY_CH, WOS_SECRET]):
+    print("Missing one of: DISCORD_BOT_TOKEN, DISCORD_CODES_CHANNEL_ID, DISCORD_IDS_CHANNEL_ID, DISCORD_SUMMARY_CHANNEL_ID, WOS_SECRET")
+    sys.exit(0)  # soft exit to allow quick iteration
 
-# ========== DISCORD REST ==========
+# ===================== DISCORD REST =====================
 D_API = "https://discord.com/api/v10"
 D_HDR = {"Authorization": f"Bot {BOT_TOKEN}"}
 
@@ -81,12 +83,12 @@ def get_me():
     r.raise_for_status()
     return r.json()["id"]
 
-# ========== PARSERS ==========
+# ===================== PARSERS =====================
 YAML_CODES = re.compile(r"(?mi)^\s*codes\s*:\s*$")
 YAML_FIDS  = re.compile(r"(?mi)^\s*fids\s*:\s*$")
 BULLET     = re.compile(r"(?m)^\s*-\s*(\S+)\s*$")
 CSV_CODE   = re.compile(r"(?mi)^\s*([A-Za-z0-9]{4,24})\s*$")
-CSV_FID    = re.compile(r"(?mi)^\s*(\d{6,12})\s*$")
+CSV_FID    = re.compile(r"(?mi)^\s*(\d{6,18})\s*$")
 
 def parse_codes(text):
     out, current = set(), None
@@ -121,7 +123,7 @@ def fetch_text_attachments(msg):
                 print(f"[WARN] Attachment fetch threw for {name}")
     return texts
 
-# ========== WOS ENDPOINTS ==========
+# ===================== WOS ENDPOINTS =====================
 PLAYER_URL   = "https://wos-giftcode-api.centurygame.com/api/player"
 GIFTCODE_URL = "https://wos-giftcode-api.centurygame.com/api/gift_code"
 ORIGIN       = "https://wos-giftcode.centurygame.com"
@@ -134,19 +136,9 @@ def sign_sorted(form: dict, secret: str) -> str:
     base  = "&".join([f"{k}={v}" for k, v in items])
     return md5(base + secret)
 
-# ---- generic signer to cover many server variants ----
+# signer variants you were probing
 def build_sign(fid: str, cdk: str, ts_value: str, secret: str,
                order="fixed", concat="plain", uppercase=False, include_lang=False):
-    """
-    order: 'fixed' -> fid,cdk,time,(lang?)
-           'sorted'-> alphabetical over present keys
-    concat: 'plain' -> + secret
-            'amp'   -> + '&' + secret
-            'key'   -> + '&key=' + secret
-            'prefix'-> secret + base
-    uppercase: bool -> MD5 hex uppercase
-    include_lang: bool -> include lang=en in both payload and base
-    """
     pieces = {"fid": fid, "cdk": cdk, "time": ts_value}
     if include_lang:
         pieces["lang"] = "en"
@@ -154,7 +146,6 @@ def build_sign(fid: str, cdk: str, ts_value: str, secret: str,
     if order == "sorted":
         items = sorted(pieces.items())
     else:
-        # fixed: keep insertion order fid,cdk,time,(lang)
         items = [(k, pieces[k]) for k in ("fid", "cdk", "time") if k in pieces]
         if "lang" in pieces: items.append(("lang","en"))
 
@@ -218,7 +209,7 @@ def get_cookie_header():
             pairs.append(f"{c['name']}={c['value']}")
     return "; ".join(pairs)
 
-# Single redeem attempt with a specified variant
+# one redeem attempt (optionally includes a manual captcha if provided)
 def redeem_once(cookie_hdr: str, fid: str, code: str, variant: dict):
     ts_value = str(int(time.time() * 1000)) if variant.get("ts") == "ms" else str(int(time.time()))
     sign = build_sign(fid, code, ts_value, WOS_SECRET,
@@ -229,6 +220,8 @@ def redeem_once(cookie_hdr: str, fid: str, code: str, variant: dict):
     payload = {"fid": fid, "cdk": code, "time": ts_value, "sign": sign}
     if variant.get("lang", False):
         payload["lang"] = "en"
+    if MANUAL_CAPTCHA:
+        payload["captcha_code"] = MANUAL_CAPTCHA  # optional, only if you pass it
 
     method = variant.get("method","POST")
     body   = variant.get("body","form")  # 'form' or 'json'
@@ -239,16 +232,15 @@ def redeem_once(cookie_hdr: str, fid: str, code: str, variant: dict):
     else:
         return get_form(GIFTCODE_URL, payload, cookie_hdr if use_cookie else None)
 
-# ========== MAIN ==========
+# ===================== MAIN =====================
 had_unhandled_error = False
 error_summary = ""
-startup_rc = post_message(STATE_CH, "🟢 WOS daily run starting…")
-print(f"[INFO] Startup ping HTTP={startup_rc}")
+post_message(SUMMARY_CH, "🟢 WOS daily run starting…")
 
 try:
-    # ---- load state from Discord ----
+    # ---- load state from SUMMARY channel ----
     bot_id = get_me()
-    prev_state_msg_id, state = find_latest_state_message(STATE_CH, bot_id)
+    prev_state_msg_id, state = find_latest_state_message(SUMMARY_CH, bot_id)
     last_codes = int(state.get("last_id_codes") or 0)
     last_ids   = int(state.get("last_id_ids") or 0)
     roster     = state.get("roster") or {}   # {fid: {nickname, stove, updated_at}}
@@ -261,7 +253,7 @@ try:
         codes |= parse_codes(txt)
         for t in fetch_text_attachments(m):
             codes |= parse_codes(t)
-        last_codes = max(last_codes, int(m["id"]))  # advance pointer even if no codes in this msg
+        last_codes = max(last_codes, int(m["id"]))  # advance pointer
 
     # ---- read fids since last checkpoint ----
     msgs_ids = get_messages_after(IDS_CH, last_ids)
@@ -273,189 +265,141 @@ try:
             new_fids |= parse_fids(t)
         last_ids = max(last_ids, int(m["id"]))
 
-    # ---- update roster ----
+    # ---- update roster with any new IDs ----
     added = []
     for fid in sorted(new_fids):
         if fid not in roster:
             roster[fid] = {"nickname": None, "stove": None, "updated_at": None}
             added.append(fid)
 
-    # ---- furnace scan ----
+    # ---- player scan (nickname + furnace) ----
     cookie_hdr = get_cookie_header()
-    print("Cookie:", "[present]" if cookie_hdr else "[none]")
-
     ok_players = 0
-    furnace_ups = []
+    furnace_ups, name_changes = [], []
+
+    def nickname_of(data): return (data or {}).get("nickname")
+    def furnace_of(data):
+        # your old code used 'stove_lv'; some responses use 'furnace_lv'
+        return (data or {}).get("stove_lv") or (data or {}).get("furnace_lv")
+
     for fid, rec in roster.items():
         ts = str(int(time.time()))
-        # player endpoint typically uses sorted signature without cookie
         sign_p = sign_sorted({"fid": fid, "time": ts}, WOS_SECRET)
-        hp, bp = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p}, cookie=None)
-        try:
-            js = json.loads(bp)
-        except Exception:
-            js = {}
 
-        if hp == 200 and js.get("msg") == "success":
-            ok_players += 1
-            data = js.get("data", {})
-            nick  = data.get("nickname")
-            stove = data.get("stove_lv")
-            prev  = rec.get("stove")
-            rec.update({"nickname": nick, "stove": stove, "updated_at": int(time.time())})
+        # try without cookie, then with cookie
+        for cookie_try in (None, cookie_hdr or None):
+            hp, bp = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p}, cookie=cookie_try)
             try:
-                if prev is not None and stove is not None and int(stove) > int(prev):
-                    furnace_ups.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
+                js = json.loads(bp)
             except Exception:
-                pass
-        else:
-            # Some deployments want cookie here too; try once more with cookie if first failed
-            hp2, bp2 = post_form(PLAYER_URL, {"fid": fid, "time": ts, "sign": sign_p}, cookie_hdr or None)
-            try:
-                js2 = json.loads(bp2)
-            except Exception:
-                js2 = {}
-            if hp2 == 200 and js2.get("msg") == "success":
+                js = {}
+            if hp == 200 and js.get("msg") == "success":
                 ok_players += 1
-                data = js2.get("data", {})
-                nick  = data.get("nickname")
-                stove = data.get("stove_lv")
-                prev  = rec.get("stove")
-                rec.update({"nickname": nick, "stove": stove, "updated_at": int(time.time())})
+                data = js.get("data", {})
+                nick_new  = nickname_of(data)
+                stove_new = furnace_of(data)
+                nick_old  = rec.get("nickname")
+                stove_old = rec.get("stove")
+
+                # nickname change tracking
+                if nick_new and nick_old and nick_new != nick_old:
+                    name_changes.append(f"📝 `{fid}` `{nick_old}` → `{nick_new}`")
+
+                # furnace level up
+                rec.update({"nickname": nick_new, "stove": stove_new, "updated_at": int(time.time())})
                 try:
-                    if prev is not None and stove is not None and int(stove) > int(prev):
-                        furnace_ups.append(f"🔥 `{fid}` {nick or ''} • {prev} ➜ {stove}")
+                    if stove_old is not None and stove_new is not None and int(stove_new) > int(stove_old):
+                        who = nick_new or nick_old or ""
+                        furnace_ups.append(f"🔥 `{fid}` {who} • {stove_old} ➜ {stove_new}")
                 except Exception:
                     pass
+                break  # success path
         time.sleep(0.1)
 
-    # ---- snapshot if no ups ----
     furnace_snapshot = []
     if not furnace_ups:
         for fid, rec in roster.items():
             if rec.get("stove") is not None:
-                furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {rec.get('nickname') or ''}")
+                who = rec.get("nickname") or ""
+                furnace_snapshot.append(f"`{fid}` • L{rec['stove']} {who}")
         furnace_snapshot.sort()
 
     # ---- redeem for all roster fids ----
     ok_redeems = fail_redeems = 0
     redeem_lines = []
 
-    # pacing and backoff
-    PACING = float(os.environ.get("REDEEM_PACING_SECONDS", "1.25"))
-
-    def redeem_with_backoff(cookie_hdr, fid, code, variant):
-        """Retry same variant when server says 429 (rate limited)."""
-        http, bodytxt = None, ""
-        for i in range(3):
-            http, bodytxt = redeem_once(cookie_hdr, fid, code, variant)
-            if http == 429:
-                # exponential backoff: 2s, 4s, 8s
-                time.sleep(2 ** (i + 1))
-                continue
-            break
-        return http, bodytxt
-
-    # default attempt list; we'll re-order based on method_hint
     DEFAULT_ATTEMPTS = [
-        # method, order, concat, ts, uppercase, lang, body, use_cookie
         ("POST","fixed","plain","s", False, False,"form", True),
         ("POST","sorted","plain","s", False, False,"form", True),
+        ("POST","fixed","plain","ms",False, False,"form", True),
         ("POST","fixed","amp",  "s", False, False,"form", True),
         ("POST","fixed","key",  "s", False, False,"form", True),
         ("POST","fixed","prefix","s", False, False,"form", True),
-        ("POST","fixed","plain","ms",False, False,"form", True),
         ("POST","fixed","plain","s", True,  False,"form", True),
         ("POST","fixed","plain","s", False, True, "form", True),
-        ("POST","fixed","plain","s", False, False,"json", True),  # JSON body
-
-        # try without cookie once
-        ("POST","fixed","plain","s", False, False,"form", False),
-
-        # GET variants
+        ("POST","fixed","plain","s", False, False,"json", True),
+        ("POST","fixed","plain","s", False, False,"form", False),  # no cookie once
         ("GET","fixed","plain","s", False, False,"form", True),
-        ("GET","sorted","plain","s", False, False,"form", True),
-        ("GET","fixed","amp",  "s", False, False,"form", True),
-        ("GET","fixed","key",  "s", False, False,"form", True),
-        ("GET","fixed","prefix","s", False, False,"form", True),
-        ("GET","fixed","plain","ms",False, False,"form", True),
-        ("GET","fixed","plain","s", True,  False,"form", True),
-        ("GET","fixed","plain","s", False, True, "form", True),
-        ("GET","fixed","plain","s", False, False,"form", False),
     ]
 
-    def attempts_for_hint(method_hint: str | None):
-        if method_hint == "GET":
-            gets = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
-            posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
-            return gets + posts
-        if method_hint == "POST":
-            posts = [a for a in DEFAULT_ATTEMPTS if a[0] == "POST"]
-            gets  = [a for a in DEFAULT_ATTEMPTS if a[0] == "GET"]
-            return posts + gets
-        return DEFAULT_ATTEMPTS
-
-    method_hint = None   # will be set to "GET" or "POST" after first 405 we see
+    def redeem_with_backoff(cookie_hdr, fid, code, variant):
+        for i in range(3):
+            http, bodytxt = redeem_once(cookie_hdr, fid, code, variant)
+            if http == 429:
+                time.sleep(2 ** (i + 1))
+                continue
+            return http, bodytxt
+        return http, bodytxt
 
     for code in sorted(codes):
         safe_code = code[:3]+"…" if len(code)>3 else code
-
-        # build the attempt order for this code (method hint carries across FIDs)
-        ATTEMPTS = attempts_for_hint(method_hint)
-
-        for idx, fid in enumerate(sorted(roster.keys())):
+        for fid in sorted(roster.keys()):
             status = "UNKNOWN"
-
-            for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in ATTEMPTS:
+            for (method, order, concat, ts_mode, upper, lang, body, use_cookie) in DEFAULT_ATTEMPTS:
                 variant = {
                     "method": method, "order": order, "concat": concat,
                     "ts": ts_mode, "uppercase": upper, "lang": lang,
                     "body": body, "use_cookie": use_cookie
                 }
-
                 http, bodytxt = redeem_with_backoff(cookie_hdr, fid, code, variant)
+                upper_body = (bodytxt or "").upper()
+                # classify common server messages
+                msg = ""
                 try:
-                    rg = json.loads(bodytxt); msg = (rg.get("msg") or "").upper()
+                    rg = json.loads(bodytxt)
+                    msg = (rg.get("msg") or "").upper()
                 except Exception:
-                    msg = (bodytxt or "")[:100].upper()
-
-                # Auto-learn: if the very first attempt with this method returns 405, flip the hint
-                if http == 405:
-                    if method_hint is None:
-                        method_hint = "GET" if method == "POST" else "POST"
-                        if DEBUG:
-                            print(f"[DEBUG] Switching method_hint -> {method_hint} after 405")
-                        ATTEMPTS = attempts_for_hint(method_hint)
-                        continue
-                    else:
-                        continue
+                    msg = upper_body[:120]
 
                 if "SUCCESS" in msg:
                     status = "SUCCESS"; break
-                elif "RECEIVED" in msg:
+                if "RECEIVED" in msg:
                     status = "ALREADY"; break
-                elif "SAME TYPE EXCHANGE" in msg:
+                if "SAME TYPE EXCHANGE" in msg:
                     status = "SAME_TYPE"; break
-                elif "TIME ERROR" in msg:
+                if "TIME ERROR" in msg:
                     status = "EXPIRED"; break
-                elif "CDK NOT FOUND" in msg:
+                if "CDK NOT FOUND" in msg:
                     status = "INVALID"; break
-                elif "PARAMS" in msg or "SIGN" in msg:
-                    status = "PARAMS_ERROR" if "PARAMS" in msg else "SIGN ERROR"
+                if "CAPTCHA" in msg or "VERIFY" in msg:
+                    status = "CAPTCHA_REQUIRED"; break
+                if "SIGN" in msg or "PARAM" in msg:
+                    status = "SIGN/PARAM"; continue  # try next variant
+                # fallback on HTTP codes
+                if http == 405:
                     continue
-                else:
-                    status = msg or f"HTTP_{http}"
-                    if status not in ("UNKNOWN","PARSE_ERROR"):
-                        break
+                if http == 200 and not msg:
+                    status = "UNKNOWN_200"; break
+                status = f"HTTP_{http}"
+                if http not in (429,):  # on 429 we would have retried already
+                    break
 
             ok = status in ("SUCCESS","ALREADY","SAME_TYPE")
             ok_redeems += int(ok); fail_redeems += int(not ok)
             redeem_lines.append(f"{'✅' if ok else '❌'} {fid} • {safe_code} • {status}")
-
-            # global pacing to avoid 429
             time.sleep(PACING)
 
-    # ---- save next checkpoint/state back to Discord (attachment) ----
+    # ---- save next checkpoint/state back to the SAME SUMMARY channel ----
     new_state = {
         "last_id_codes": str(last_codes),
         "last_id_ids":   str(last_ids),
@@ -463,9 +407,9 @@ try:
         "ts":            int(time.time()),
     }
     state_bytes = json.dumps(new_state, indent=2).encode("utf-8")
-    msg = post_message_with_file(STATE_CH, "WOSBOT_STATE v1 (do not delete)", "wos_state.json", state_bytes)
-    if msg and "id" in msg and prev_state_msg_id:
-        delete_message(STATE_CH, prev_state_msg_id)
+    msg = post_message_with_file(SUMMARY_CH, "WOSBOT_STATE v1 (do not delete)", "wos_state.json", state_bytes)
+    if msg and "id" in msg and 'prev_state_msg_id' in locals() and prev_state_msg_id:
+        delete_message(SUMMARY_CH, prev_state_msg_id)
 
 except Exception as e:
     had_unhandled_error = True
@@ -473,12 +417,14 @@ except Exception as e:
     print("[FATAL] Unhandled exception. Traceback follows:")
     traceback.print_exc()
 
-# ========== SUMMARY (always try) ==========
+# ===================== SUMMARY (always) =====================
 parts = []
 if 'added' in locals() and added:
     parts.append("**New IDs added**\n" + ", ".join(f"`{a}`" for a in added[:20]) + (" …" if len(added)>20 else ""))
 if 'codes' in locals() and codes:
     parts.append("**Codes processed**\n" + ", ".join(f"`{c}`" for c in sorted(codes)))
+if 'name_changes' in locals() and name_changes:
+    parts.append("**Nickname changes**\n" + "\n".join(name_changes[:15]) + (" \n…" if len(name_changes)>15 else ""))
 if 'furnace_ups' in locals() and furnace_ups:
     parts.append("**Furnace level ups**\n" + "\n".join(furnace_ups[:15]) + (" \n…" if len(furnace_ups)>15 else ""))
 elif 'furnace_snapshot' in locals() and furnace_snapshot:
@@ -498,8 +444,5 @@ summary = (
 if had_unhandled_error and error_summary:
     summary += f"\n\n⚠️ {error_summary}"
 
-rc = post_message(STATE_CH, summary + ("\n" + "\n\n".join(parts) if parts else "\n(No changes)"))
-print(f"[INFO] Posted summary HTTP={rc}")
-
-# Keep workflow green while you iterate; inspect summary/logs for issues
+post_message(SUMMARY_CH, summary + ("\n" + "\n\n".join(parts) if parts else "\n(No changes)"))
 sys.exit(0)
