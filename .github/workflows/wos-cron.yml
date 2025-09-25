@@ -29,17 +29,25 @@ jobs:
 
       - name: Prepare folders
         run: mkdir -p state logs
+        
+      - name: List repo
+        run: |
+          pwd
+          ls -la
+          echo "-- scripts --"
+          ls -la scripts || true
 
       - name: Run daily
         env:
           DISCORD_BOT_TOKEN:          ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_IDS_CHANNEL_ID:     ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
           DISCORD_CODES_CHANNEL_ID:   ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
-          DISCORD_SUMMARY_CHANNEL_ID: ${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}
+          DISCORD_SUMMARY_CHANNEL_ID: ${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}   # <-- space added
           ALLIANCE_NAME:              ${{ secrets.ALLIANCE_NAME }}
           WOS_SECRET:                 ${{ secrets.WOS_SECRET }}
           REDEEM_PACING_SECONDS:      ${{ secrets.REDEEM_PACING_SECONDS }}
-        run: python scripts/daily.py
+        run: python scripts/daily.py   # <-- corrected path
+      
 
       - name: Commit state
         run: |
