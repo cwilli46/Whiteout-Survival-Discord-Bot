@@ -17,10 +17,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps (requests + Playwright + Chromium)
+      # Lightweight deps + browser + free OCR
+      - name: Install runtime deps
         run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
           python -m pip install --upgrade pip
-          pip install requests playwright
+          pip install requests pillow pytesseract playwright
           python -m playwright install --with-deps chromium
 
       - name: Preflight env echo (redacted)
@@ -37,8 +40,9 @@ jobs:
           DISCORD_IDS_CHANNEL_ID: ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
           DISCORD_STATE_CHANNEL_ID: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
           WOS_SECRET: ${{ secrets.WOS_SECRET }}
+          # make it slower to avoid 429 when captcha mismatches
+          REDEEM_PACING_SECONDS: "3.0"
           DEBUG: "0"
-          REDEEM_PACING_SECONDS: "1.25"
         run: |
           set -e
           python scripts/daily_discord_batch_v2.py
