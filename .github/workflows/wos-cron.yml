@@ -32,13 +32,13 @@ jobs:
 
       - name: Run daily
         env:
-          DISCORD_BOT_TOKEN:         ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_IDS_CHANNEL_ID:    ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
-          DISCORD_CODES_CHANNEL_ID:  ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
-          DISCORD_SUMMARY_CHANNEL_ID:${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}
-          ALLIANCE_NAME:             ${{ secrets.ALLIANCE_NAME }}   # e.g., AXE
-          WOS_SECRET:                ${{ secrets.WOS_SECRET }}      # from your secrets
-          REDEEM_PACING_SECONDS:     ${{ secrets.REDEEM_PACING_SECONDS }} # optional; defaults 0.3
+          DISCORD_BOT_TOKEN:          ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_IDS_CHANNEL_ID:     ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
+          DISCORD_CODES_CHANNEL_ID:   ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
+          DISCORD_SUMMARY_CHANNEL_ID: ${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}
+          ALLIANCE_NAME:              ${{ secrets.ALLIANCE_NAME }}
+          WOS_SECRET:                 ${{ secrets.WOS_SECRET }}
+          REDEEM_PACING_SECONDS:      ${{ secrets.REDEEM_PACING_SECONDS }}
         run: python .github/scripts/daily.py
 
       - name: Commit state
