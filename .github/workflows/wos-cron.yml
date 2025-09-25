@@ -11,6 +11,7 @@ permissions:
 jobs:
   daily:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,37 +30,13 @@ jobs:
 
       - name: Prepare folders
         run: mkdir -p state logs
-        
-      - name: List repo
-        run: |
-          pwd
-          ls -la
-          echo "-- scripts --"
-          ls -la scripts || true
 
       - name: Run daily
         env:
           DISCORD_BOT_TOKEN:          ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_IDS_CHANNEL_ID:     ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
           DISCORD_CODES_CHANNEL_ID:   ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
-          DISCORD_SUMMARY_CHANNEL_ID: ${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}   # <-- space added
+          DISCORD_SUMMARY_CHANNEL_ID: ${{ secrets.DISCORD_SUMMARY_CHANNEL_ID }}
           ALLIANCE_NAME:              ${{ secrets.ALLIANCE_NAME }}
           WOS_SECRET:                 ${{ secrets.WOS_SECRET }}
-          REDEEM_PACING_SECONDS:      ${{ secrets.REDEEM_PACING_SECONDS }}
-        run: python scripts/daily.py   # <-- corrected path
-      
-
-      - name: Commit state
-        run: |
-          git config user.name  "wos-bot"
-          git config user.email "wos-bot@users.noreply.github.com"
-          git add state/*.json logs/*.txt 2>/dev/null || true
-          git commit -m "chore: daily state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
-          git push || true
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wos-logs
-          path: logs
+          REDEEM_PACING_SE
