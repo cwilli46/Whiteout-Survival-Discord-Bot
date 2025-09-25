@@ -1,8 +1,8 @@
 import os, re, json, time, hashlib, requests, pathlib, datetime
 from typing import List, Dict, Tuple
 
-# was: parents[2]
-ROOT = pathlib.Path(__file__).resolve().parents[1]  # from /scripts to repo root
+# repo root (this file is in /scripts)
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 STATE = ROOT / "state" / "members.json"
 LOGS  = ROOT / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
@@ -57,10 +57,8 @@ def discord_session():
     return s
 
 def discord_fetch_all_messages(channel_id: str, limit_total: int = 1000) -> List[dict]:
-    """Page through recent messages so you can store FIDs/Codes in pinned or recent posts."""
     s = discord_session()
-    msgs, last_id = [], None
-    remaining = limit_total
+    msgs, last_id, remaining = [], None, limit_total
     while remaining > 0:
         params = {"limit": min(100, remaining)}
         if last_id:
@@ -82,29 +80,22 @@ def discord_post(channel_id: str, content: str):
     if not channel_id or not content:
         return
     s = discord_session()
-    # chunk to 2000-char Discord limit
-    chunks = []
+    # Discord limit ~2000 chars
     while content:
-        chunks.append(content[:1900])
-        content = content[1900:]
-    for c in chunks:
+        chunk, content = content[:1900], content[1900:]
         r = s.post(f"https://discord.com/api/v10/channels/{channel_id}/messages",
-                   json={"content": c}, timeout=30)
+                   json={"content": chunk}, timeout=30)
         log(f"POST to {channel_id} -> {r.status_code}", "discord.log")
         time.sleep(1)
 
 # ---- Parsers
-FID_RE = re.compile(r"\b\d{3,18}\b")  # FID = numeric id, fairly long
+FID_RE = re.compile(r"\b\d{3,18}\b")
 CODE_RE = re.compile(r"\b[A-Z0-9]{4,20}\b", re.I)
 
 def parse_fids_from_messages(msgs: List[dict]) -> List[str]:
     fids = set()
     for m in msgs:
-        if m.get("author", {}).get("bot"):
-            # allow bot posts too—teams sometimes paste lists via bot
-            pass
         text = (m.get("content") or "").strip()
-        # Skip obvious comments
         if text.startswith("#"):
             continue
         for tok in FID_RE.findall(text):
@@ -112,8 +103,7 @@ def parse_fids_from_messages(msgs: List[dict]) -> List[str]:
     return sorted(fids, key=lambda x: int(x))
 
 def parse_codes_from_messages(msgs: List[dict]) -> List[str]:
-    codes = []
-    seen = set()
+    codes, seen = [], set()
     for m in msgs:
         text = (m.get("content") or "").upper()
         if text.startswith("#"):
@@ -205,11 +195,10 @@ def main():
         log("Missing DISCORD_SUMMARY_CHANNEL_ID; abort")
         return
 
-    # 1) Pull FIDs and Codes from Discord channels
     fid_msgs = discord_fetch_all_messages(CHAN_FIDS, limit_total=400)
     fids = parse_fids_from_messages(fid_msgs)
     if not fids:
-        discord_post(CHAN_SUMMARY, "⚠️ No FIDs found in the IDs channel. Please paste numeric FIDs (one per line).")
+        discord_post(CHAN_SUMMARY, "⚠️ No FIDs found in the IDs channel. Paste numeric FIDs (one per line).")
         log("No FIDs parsed; abort")
         return
 
@@ -218,7 +207,6 @@ def main():
         code_msgs = discord_fetch_all_messages(CHAN_CODES, limit_total=400)
         code_list = parse_codes_from_messages(code_msgs)
 
-    # 2) Fetch current player data
     prev = load_snapshot()
     curr = {}
     for fid in fids:
@@ -227,19 +215,17 @@ def main():
             curr[fid] = data
         time.sleep(PACE)
 
-    # 3) Diff and post summary
     name_msg, furnace_msg = summarize_diffs(prev, curr)
-    summary = f"**Daily WOS Summary — {ALLIANCE}**\n" \
-              f"{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n" \
-              f"{name_msg}\n\n{furnace_msg}"
-
+    summary = (
+        f"**Daily WOS Summary — {ALLIANCE}**\n"
+        f"{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"{name_msg}\n\n{furnace_msg}"
+    )
     discord_post(CHAN_SUMMARY, summary)
 
-    # 4) Codes (broadcast as manual redeem list — no auto-redeem to avoid CAPTCHA/TOS issues)
     if code_list:
         discord_post(CHAN_SUMMARY, codes_summary(code_list))
 
-    # 5) Save snapshot for tomorrow
     save_snapshot(curr)
 
 if __name__ == "__main__":
