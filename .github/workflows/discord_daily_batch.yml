@@ -1,37 +1,85 @@
-name: WOS Gift Codes Daily
+name: discord_daily_batch
+name: WOS Gift Bot (daily)
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '25 16 * * *'  # adjust as desired (UTC)
+workflow_dispatch:
+schedule:
+    - cron: "20 9 * * *"   # daily 09:20 UTC
+    - cron: "23 11 * * *"  # adjust to your preferred time (UTC)
+
+concurrency:
+  group: discord-daily
+  cancel-in-progress: false
+permissions:
+  contents: read
 
 jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
+run:
+runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      PYTHONWARNINGS: ignore
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # Debug/test tuning (feel free to change or remove later)
+      DEBUG: "0"
+      SAVE_CAPTCHAS: "0"
+      REDEEM_PACING_SECONDS: "1.8"
+      REDEEM_MAX_ATTEMPTS: "3"
+      CAPTCHA_MAX_REFRESH: "4"
+      MAX_FIDS: "0"      # 0 = no cap; set small numbers while testing
+      MAX_CODES: "1"
+
+      # Required secrets
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DISCORD_CODES_CHANNEL_ID: ${{ secrets.DISCORD_CODES_CHANNEL_ID }}
+      DISCORD_IDS_CHANNEL_ID: ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
+      DISCORD_STATE_CHANNEL_ID: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
+      WOS_SECRET: ${{ secrets.WOS_SECRET }}
+
+steps:
       - name: Checkout
-        uses: actions/checkout@v4
+      - name: Check out
+uses: actions/checkout@v4
 
+      - name: Setup Python
       - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+uses: actions/setup-python@v5
+with:
+python-version: "3.11"
+          cache: "pip"
 
-      - name: Install system deps (tesseract OCR)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
+      - name: Install system deps (tesseract + fonts)
+      - name: Install system deps (Tesseract + Playwright deps)
+run: |
+         sudo apt-get update
+          sudo apt-get install -y tesseract-ocr libtesseract-dev fonts-dejavu-core
 
       - name: Install Python deps
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pillow pytesseract
+          sudo apt-get install -y tesseract-ocr libtesseract-dev
+         python -m pip install --upgrade pip
+          pip install requests pillow pytesseract easyocr playwright
 
-      - name: Sanity check (show script header; ensure no playwright)
-        run: |
-          echo "HEAD: $(git rev-parse --short HEAD)"
-          sed -n '1,30p' scripts/daily_discord_batch_v2.py
-          (grep -Rin "playwright" scripts || true)
+      - name: Install Playwright Chromium
+      - name: Install Python libs
+run: |
+          python -m playwright install chromium --with-deps
+          pip install requests pillow pytesseract playwright
+          python -m playwright install --with-deps chromium
+
+     - name: Preflight env echo (redacted)
+run: |
+@@ -64,9 +39,21 @@ jobs:
+         echo "State channel set:  $([ -n "$DISCORD_STATE_CHANNEL_ID" ] && echo true || echo false)"
+         echo "WOS secret set:     $([ -n "$WOS_SECRET" ] && echo true || echo false)"
+
+      - name: Run daily job
+      - name: Locate script
+run: |
+         set -e
+         test -f scripts/daily_discord_batch.py
+         echo "Found script: scripts/daily_discord_batch.py"
 
       - name: Run daily job
         env:
@@ -40,7 +88,8 @@ jobs:
           DISCORD_IDS_CHANNEL_ID: ${{ secrets.DISCORD_IDS_CHANNEL_ID }}
           DISCORD_STATE_CHANNEL_ID: ${{ secrets.DISCORD_STATE_CHANNEL_ID }}
           WOS_SECRET: ${{ secrets.WOS_SECRET }}
+          REDEEM_PACING_SECONDS: "1.4"
           DEBUG: "0"
         run: |
           set -e
-          python scripts/daily_discord_batch_v2.py
+         python scripts/daily_discord_batch.py
