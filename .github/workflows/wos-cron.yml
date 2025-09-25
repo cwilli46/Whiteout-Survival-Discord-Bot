@@ -39,7 +39,7 @@ jobs:
           ALLIANCE_NAME:              ${{ secrets.ALLIANCE_NAME }}
           WOS_SECRET:                 ${{ secrets.WOS_SECRET }}
           REDEEM_PACING_SECONDS:      ${{ secrets.REDEEM_PACING_SECONDS }}
-        run: python .github/scripts/daily.py
+        run: python scripts/daily.py
 
       - name: Commit state
         run: |
