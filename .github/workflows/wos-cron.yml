@@ -1,0 +1,59 @@
+name: WOS Daily
+
+on:
+  schedule:
+    - cron: "20 9 * * *"   # 09:20 UTC daily (~02:20 Phoenix)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests discord-webhook pytz
+
+      - name: Prepare folders
+        run: |
+          mkdir -p state logs
+
+      - name: Run daily tasks
+        env:
+          DISCORD_WEBHOOK_FURNACE: ${{ secrets.DISCORD_WEBHOOK_FURNACE }}
+          DISCORD_WEBHOOK_CHANGES: ${{ secrets.DISCORD_WEBHOOK_CHANGES }}
+          DISCORD_WEBHOOK_CODES:   ${{ secrets.DISCORD_WEBHOOK_CODES }}
+          ALLIANCE_NAME:           ${{ secrets.ALLIANCE_NAME }}     # e.g. AXE
+          WOS_MEMBER_FIDS:         ${{ secrets.WOS_MEMBER_FIDS }}   # comma-separated FIDs
+          TEST_FID:                ${{ secrets.TEST_FID }}          # optional single FID for code “preflight”
+        run: |
+          python .github/scripts/daily.py
+
+      - name: Commit state (diff memory)
+        run: |
+          git config user.name  "wos-bot"
+          git config user.email "wos-bot@users.noreply.github.com"
+          git add state/*.json logs/*.txt 2>/dev/null || true
+          git commit -m "chore: daily state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes to commit"
+          git push || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wos-logs
+          path: logs
